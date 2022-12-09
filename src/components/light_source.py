@@ -7,6 +7,7 @@ These classes should be connected to one or two entities, respectively, that are
 from typing import List
 
 from numpy import multiply
+import random
 
 from .photon import Photon
 from ..kernel.entity import Entity
@@ -31,10 +32,12 @@ class LightSource(Entity):
         encoding_type (Dict[str, Any]): encoding scheme of emitted photons (as defined in the encoding module).
         phase_error (float): phase error applied to qubits.
         photon_counter (int): counter for number of photons emitted.
+        random_frequency (bool): if False photon creation will be in periods defined by frequency if True It will be random period arround the defined one by the frequency
+
     """
 
     def __init__(self, name, timeline, frequency=8e7, wavelength=1550, bandwidth=0, mean_photon_num=0.1,
-                 encoding_type=polarization, phase_error=0):
+                 encoding_type=polarization, phase_error=0, random_frequency=False):
         """Constructor for the LightSource class.
 
         Arguments:
@@ -46,6 +49,8 @@ class LightSource(Entity):
             mean_photon_num (float): mean number of photons emitted each period (default 0.1).
             encoding_type (Dict): encoding scheme of emitted photons (as defined in the encoding module) (default polarization).
             phase_error (float): phase error applied to qubits (default 0).
+            random_frequency (bool): if False photon creation will be in periods defined by frequency if True It will be random period arround the defined one by the frequency
+
         """
 
         Entity.__init__(self, name, timeline)
@@ -56,6 +61,7 @@ class LightSource(Entity):
         self.encoding_type = encoding_type
         self.phase_error = phase_error
         self.photon_counter = 0
+        self.random_frequency = random_frequency
 
     def init(self):
         """Implementation of Entity interface (see base class)."""
@@ -114,14 +120,16 @@ class SPDCSource(LightSource):
         mean_photon_num (float): mean number of photons emitted each period.
         encoding_type (Dict): encoding scheme of emitted photons (as defined in the encoding module).
         phase_error (float): phase error applied to qubits.
+        random_frequency (bool): if False photon creation will be in periods defined by frequency if True It will be random period arround the defined one by the frequency
     """
 
     def __init__(self, name, timeline, wavelengths=None, frequency=8e7, bandwidth=0, mean_photon_num=0.1,
-                 encoding_type=polarization, phase_error=0):
-        super().__init__(name, timeline, frequency, 0, bandwidth, mean_photon_num, encoding_type, phase_error)
+                 encoding_type=polarization, phase_error=0, random_frequency = False):
+        super().__init__(name, timeline, frequency, 0, bandwidth, mean_photon_num, encoding_type, phase_error,random_frequency)
         if wavelengths is None:
             wavelengths = [1550, 1550]
         self.wavelengths = wavelengths
+
 
     def init(self):
         assert len(self._receivers) == 2, "SPDC source must connect to 2 receivers."
@@ -138,7 +146,6 @@ class SPDCSource(LightSource):
         """
 
         log.logger.info("SPDC sourcee {} emitting {} photons".format(self.name, len(state_list)))
-
         time = self.timeline.now()
 
         if self.encoding_type["name"] == "absorptive":
@@ -180,17 +187,19 @@ class SPDCSource(LightSource):
                     new_photon0.entangle(new_photon1)
                     new_photon0.set_state((complex(1), complex(0), complex(0), complex(0)))
                     self.send_photons(time, [new_photon0, new_photon1])
-
                 time += 1e12 / self.frequency
 
         else:
+            self.num_photon_pairs_list = []
             for state in state_list:
                 num_photon_pairs = self.get_generator().poisson(
                 self.mean_photon_num)
+                self.num_photon_pairs_list.append(num_photon_pairs)
 
                 if self.get_generator().random() < self.phase_error:
                     state = multiply([1, -1], state)
 
+                state_period = 1e12 / self.frequency
                 for _ in range(num_photon_pairs):
                     new_photon0 = Photon("", self.timeline,
                                          wavelength=self.wavelengths[0],
@@ -205,8 +214,11 @@ class SPDCSource(LightSource):
                     new_photon0.set_state((state[0], complex(0), complex(0), state[1]))
                     self.send_photons(time, [new_photon0, new_photon1])
                     self.photon_counter += 1
-
-                time += 1e12 / self.frequency
+                if self.random_frequency:
+                    random_delay = random.uniform(-1, 1)
+                else:
+                    random_delay = 0
+                time += state_period*(1+random_delay)
 
     def send_photons(self, time, photons: List["Photon"]):
         log.logger.debug("SPDC source {} sending photons to {} at time {}".format(
