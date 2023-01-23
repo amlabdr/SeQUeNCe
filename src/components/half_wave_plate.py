@@ -39,7 +39,7 @@ class HalfWavePlate(Entity):
         super().__init__(name, timeline)
         self.fidelity = fidelity
         self.angle = angle
-        theta = angle
+        theta = np.radians(angle)
         mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
                                                         [2*cos(theta)*sin(theta),   cos(theta)**2 - sin(theta)**2]]))
         # Extend the Jones matrix to 4x4 using the Kronecker product
@@ -59,6 +59,7 @@ class HalfWavePlate(Entity):
             angle (float): new phase to use.
         """
         theta = angle
+        theta = np.radians(angle)
         mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
                                                         [2*cos(theta)*sin(theta),   cos(theta)**2 - sin(theta)**2]]))
         # Extend the Jones matrix to 4x4 using the Kronecker product
