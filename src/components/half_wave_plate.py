@@ -3,7 +3,8 @@
 This module introduces the HalfWavePlates class.
 The wave plate modifies the phase of incoming photons, but does not add additional delay or losses.
 """
-from numpy import pi, cos, sin, multiply
+from numpy import pi, cos, sin
+from math import e
 import numpy as np
 from cmath import exp
 
@@ -13,7 +14,6 @@ if TYPE_CHECKING:
     from .photon import Photon
 
 from ..kernel.entity import Entity
-from .circuit import Circuit
 
 
 class HalfWavePlate(Entity):
@@ -39,11 +39,18 @@ class HalfWavePlate(Entity):
         super().__init__(name, timeline)
         self.fidelity = fidelity
         self.angle = angle
+        theta = angle
+        mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
+                                                        [2*cos(theta)*sin(theta),   cos(theta)**2 - sin(theta)**2]]))
+        # Extend the Jones matrix to 4x4 using the Kronecker product
+        self.HWP_4d = np.kron(mat, mat)
+        
+    
 
     def init(self):
         """Implementation of Entity interface (see base class)."""
-
         assert len(self._receivers) == 1, "BeamSplitter should only be attached to 1 output."
+        
 
 
     def set_angle(self, angle: float):
@@ -51,7 +58,11 @@ class HalfWavePlate(Entity):
         Args:
             angle (float): new phase to use.
         """
-        self.angle = angle
+        theta = angle
+        mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
+                                                        [2*cos(theta)*sin(theta),   cos(theta)**2 - sin(theta)**2]]))
+        # Extend the Jones matrix to 4x4 using the Kronecker product
+        self.HWP_4d = np.kron(mat, mat)
 
 
     def get(self, photon: "Photon", **kwargs):
@@ -62,14 +73,12 @@ class HalfWavePlate(Entity):
 
         """
 
-        assert photon.encoding_type["name"] == "polarization", "Beamsplitter should only be used with polarization."
-        rng = self.get_generator()
         state = photon.quantum_state.state
+        assert photon.encoding_type["name"] == "polarization", "hwp should only be used with polarization."
+        rng = self.get_generator()
+
         if rng.random() < self.fidelity:
-            if rng.random() < self.phase_error:
-                theta = self.angle
-                c = exp(-1j * pi / 2)
-                hwp_matrix = np.multiply(exp(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
-                                                            [2*cos(theta)*sin(theta),   cos(theta)**2 - sin(theta)**2]]))
-                state = np.dot(hwp_matrix, state)
-                photon.set_state(state)
+            state = np.dot(self.HWP_4d, state)
+            photon.set_state(state)
+        self._receivers[0].get(photon)
+        
