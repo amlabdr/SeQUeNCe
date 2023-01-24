@@ -58,6 +58,7 @@ class HalfWavePlate(Entity):
         Args:
             angle (float): new phase to use.
         """
+        self.angle=angle
         theta = angle
         theta = np.radians(angle)
         mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
@@ -65,6 +66,9 @@ class HalfWavePlate(Entity):
         # Extend the Jones matrix to 4x4 using the Kronecker product
         self.HWP_4d = np.kron(mat, mat)
 
+    def set_angle(self):
+        """Method to get the angle with fast axis """
+        return self.angle
 
     def get(self, photon: "Photon", **kwargs):
         """Method to receive a photon for measurement.
