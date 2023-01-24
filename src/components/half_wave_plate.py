@@ -66,7 +66,7 @@ class HalfWavePlate(Entity):
         # Extend the Jones matrix to 4x4 using the Kronecker product
         self.HWP_4d = np.kron(mat, mat)
 
-    def set_angle(self):
+    def get_angle(self):
         """Method to get the angle with fast axis """
         return self.angle
 
