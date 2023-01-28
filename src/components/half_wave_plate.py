@@ -83,7 +83,7 @@ class HalfWavePlate(Entity):
         rng = self.get_generator()
 
         if rng.random() < self.fidelity:
-            state = np.dot(self.HWP_4d, state)
+            state = tuple(np.dot(self.HWP_4d, state))
             photon.set_state(state)
         self._receivers[0].get(photon)
         
