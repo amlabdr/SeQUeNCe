@@ -41,7 +41,7 @@ class HalfWavePlate(Entity):
         self.angle = angle
         theta = np.radians(angle)
         mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
-                                                        [2*cos(theta)*sin(theta),   cos(theta)**2 - sin(theta)**2]]))
+                                                        [2*cos(theta)*sin(theta),   sin(theta)**2 - cos(theta)**2]]))
         # Extend the Jones matrix to 4x4 using the Kronecker product
         self.HWP_4d = np.kron(mat, mat)
         
