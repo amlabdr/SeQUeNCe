@@ -39,11 +39,6 @@ class HalfWavePlate(Entity):
         super().__init__(name, timeline)
         self.fidelity = fidelity
         self.angle = angle
-        theta = np.radians(angle)
-        mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
-                                                        [2*cos(theta)*sin(theta),   sin(theta)**2 - cos(theta)**2]]))
-        # Extend the Jones matrix to 4x4 using the Kronecker product
-        self.HWP_4d = np.kron(mat, mat)
         
     
 
@@ -51,39 +46,112 @@ class HalfWavePlate(Entity):
         """Implementation of Entity interface (see base class)."""
         assert len(self._receivers) == 1, "BeamSplitter should only be attached to 1 output."
         
-
+    def HWP_4d (self, angle):
+        mat = np.array([[cos(2*angle) , sin(2*angle)],
+                        [sin(2*angle),   -cos(2*angle)]])
+        # Extend the Jones matrix to 4x4 using the Kronecker product
+        
+        self.HWP_4dM = np.kron(mat, mat)
 
     def set_angle(self, angle: float):
         """Method to change the angle with fast axis 
         Args:
             angle (float): new phase to use.
         """
-        self.angle=angle
-        theta = angle
-        theta = np.radians(angle)
-        mat = np.multiply(e**(-1j * pi / 2), np.array([[cos(theta)**2 - sin(theta)**2 , 2*cos(theta)*sin(theta)],
-                                                        [2*cos(theta)*sin(theta),   cos(theta)**2 - sin(theta)**2]]))
-        # Extend the Jones matrix to 4x4 using the Kronecker product
-        self.HWP_4d = np.kron(mat, mat)
+        self.angle=angle/2  
+        theta = np.radians(self.angle)
+        self.HWP_4d(theta)
+        
 
     def get_angle(self):
         """Method to get the angle with fast axis """
         return self.angle
 
     def get(self, photon: "Photon", **kwargs):
+        #print("before HWP: ",photon.quantum_state.state)
         """Method to receive a photon for measurement.
 
         Args:
             photon (Photon): photon to measure (must have polarization encoding)
 
         """
-
+        
         state = photon.quantum_state.state
         assert photon.encoding_type["name"] == "polarization", "hwp should only be used with polarization."
         rng = self.get_generator()
 
         if rng.random() < self.fidelity:
-            state = tuple(np.dot(self.HWP_4d, state))
+            #state = tuple(np.dot(self.HWP_4d, state))  
+            state = tuple(self.HWP_4dM.dot(state))
             photon.set_state(state)
+        #print("after HWP: ",photon.quantum_state.state)
         self._receivers[0].get(photon)
         
+
+class HalfWavePlate2dim(Entity):
+    """Class implementing a simple half wave plate.
+
+    Attributes:
+        name (str): name of the wave plate instance.
+        timeline (Timeline): simulation timeline.
+        angle with fast axis at angle
+        fidelity (float): fraction of qubits not lost on the reflective surface
+    """
+
+    def __init__(self, name, timeline, angle = 0, fidelity=1):
+        """Constructor for wave plate class.
+
+        Args:
+            name (str): name of the wave plate.
+            timeline (Timeline): simulation timeline.
+            angle with fast axis at angle: (default 0)
+            phase (float): phase to apply to incoming photons (default 0.0).
+        """
+
+        super().__init__(name, timeline)
+        self.fidelity = fidelity
+        self.angle = angle
+        
+    
+
+    def init(self):
+        """Implementation of Entity interface (see base class)."""
+        assert len(self._receivers) == 1, "BeamSplitter should only be attached to 1 output."
+        
+    def HWP_2d (self, angle):
+        mat = np.array([[cos(2*angle) , sin(2*angle)],
+                        [sin(2*angle),   -cos(2*angle)]])
+        # Extend the Jones matrix to 4x4 using the Kronecker product
+        self.HWP_2d = mat
+
+    def set_angle(self, angle: float):
+        """Method to change the angle with fast axis 
+        Args:
+            angle (float): new phase to use.
+        """
+        self.angle=angle/2
+        theta = np.radians(self.angle)
+        self.HWP_2d(theta)
+        
+
+    def get_angle(self):
+        """Method to get the angle with fast axis """
+        return self.angle
+
+    def get(self, photon: "Photon", **kwargs):
+        #print("before HWP: ",photon.quantum_state.state)
+        """Method to receive a photon for measurement.
+
+        Args:
+            photon (Photon): photon to measure (must have polarization encoding)
+
+        """
+        
+        state = photon.quantum_state.state
+        assert photon.encoding_type["name"] == "polarization", "hwp should only be used with polarization."
+        rng = self.get_generator()
+        if rng.random() < self.fidelity:
+            state = tuple(self.HWP_2d.dot(state))
+            photon.set_state(state)
+        #print("after HWP: ",photon.quantum_state.state)
+        self._receivers[0].get(photon)
