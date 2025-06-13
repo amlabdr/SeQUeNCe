@@ -12,6 +12,7 @@ from ..kernel.event import Event
 from ..kernel.process import Process
 from ..utils.encoding import polarization, fock
 from ..utils import log
+import numpy as np
 
 
 class LightSource(Entity):
@@ -32,7 +33,7 @@ class LightSource(Entity):
     """
 
     def __init__(self, name, timeline, frequency=8e7, wavelength=1550, bandwidth=0, mean_photon_num=0.1,
-                 encoding_type=polarization, phase_error=0):
+                 encoding_type=polarization, phase_error=0, photon_statistics="thermal"):
         """Constructor for the LightSource class.
 
         Arguments:
@@ -54,11 +55,21 @@ class LightSource(Entity):
         self.encoding_type = encoding_type
         self.phase_error = phase_error
         self.photon_counter = 0
+        self.photon_statistics = photon_statistics  # "thermal" or "poisson"
 
     def init(self):
         """Implementation of Entity interface (see base class)."""
 
         pass
+
+    def sample_photon_pairs(self):
+        if self.photon_statistics == "thermal":
+            p = 1 / (1 + self.mean_photon_num)
+            return self.get_generator().geometric(p) - 1
+        elif self.photon_statistics == "poisson":
+            return self.get_generator().poisson(self.mean_photon_num)
+        else:
+            raise ValueError(f"Unknown photon_statistics mode: {self.photon_statistics}")
 
     # for general use
     def emit(self, state_list) -> None:
@@ -77,7 +88,7 @@ class LightSource(Entity):
         period = int(round(1e12 / self.frequency))
 
         for i, state in enumerate(state_list):
-            num_photons = self.get_generator().poisson(self.mean_photon_num)
+            num_photons = self.sample_photon_pairs()
 
             if self.get_generator().random() < self.phase_error:
                 state = multiply([1, -1], state)
@@ -116,8 +127,8 @@ class SPDCSource(LightSource):
     """
 
     def __init__(self, name, timeline, wavelengths=None, frequency=8e7, mean_photon_num=0.1,
-                 encoding_type=fock, phase_error=0, bandwidth=0):
-        super().__init__(name, timeline, frequency, 0, bandwidth, mean_photon_num, encoding_type, phase_error)
+                 encoding_type=fock, phase_error=0, bandwidth=0, photon_statistics="thermal"):
+        super().__init__(name, timeline, frequency, 0, bandwidth, mean_photon_num, encoding_type, phase_error, photon_statistics)
         self.wavelengths = wavelengths
         if self.wavelengths is None or len(self.wavelengths) != 2:
             self.set_wavelength()
@@ -195,7 +206,7 @@ class SPDCSource(LightSource):
 
         elif self.encoding_type["name"] == "absorptive":
             for _ in state_list:
-                num_photon_pairs = self.get_generator().poisson(self.mean_photon_num)
+                num_photon_pairs = self.sample_photon_pairs()
 
                 for _ in range(num_photon_pairs):
                     new_photon0 = Photon("", self.timeline,
@@ -237,8 +248,7 @@ class SPDCSource(LightSource):
 
         else:
             for state in state_list:
-                num_photon_pairs = self.get_generator().poisson(
-                self.mean_photon_num)
+                num_photon_pairs = self.sample_photon_pairs()
 
                 if self.get_generator().random() < self.phase_error:
                     state = multiply([1, -1], state)
