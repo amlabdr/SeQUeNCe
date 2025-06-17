@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from ..kernel.timeline import Timeline
 
 from .photon import Photon
-from .beam_splitter import BeamSplitter
+from .beam_splitter import BeamSplitter, FixedBasisBeamSplitter
 from .switch import Switch
 from .interferometer import Interferometer
 from .circuit import Circuit
@@ -695,3 +695,51 @@ class FockDetector(Detector):
 
     def received_message(self, src: str, msg):
         pass
+
+class FixedBasisPolarizationDetector(QSDetector):
+    """
+    Polarization detector using a fixed-basis beam splitter.
+
+    Attributes:
+        detectors (list): Two detectors for orthogonal polarizations.
+        splitter (FixedBasisBeamSplitter): Measures photons in a fixed polarization basis.
+        trigger_times (list[list[int]]): List of detection timestamps for each detector.
+    """
+
+    def __init__(self, name: str, timeline: "Timeline", basis_index: int = 0):
+        """
+        Args:
+            name (str): Component name.
+            timeline (Timeline): Simulation timeline.
+            basis_index (int): 0 for H/V basis, 1 for +/- diagonal basis.
+        """
+        super().__init__(name, timeline)
+
+        self.detectors = []
+        for i in range(2):
+            d = Detector(f"{name}.detector{i}", timeline, efficiency=1)
+            d.attach(self)
+            self.detectors.append(d)
+
+        self.splitter = FixedBasisBeamSplitter(f"{name}.splitter", timeline, basis_index=basis_index)
+        self.splitter.add_receiver(self.detectors[0])
+        self.splitter.add_receiver(self.detectors[1])
+
+        self.trigger_times = [[], []]
+        self.components = [self.splitter] + self.detectors
+
+    def init(self) -> None:
+        assert len(self.detectors) == 2
+        super().init()
+
+    def get(self, photon: Photon, **kwargs) -> None:
+        self.splitter.get(photon)
+
+    def get_photon_times(self):
+        times = self.trigger_times
+        self.trigger_times = [[], []]
+        return times
+
+    # Dummy methods for compatibility
+    def set_basis_list(self, *args, **kwargs): pass
+    def update_splitter_params(self, *args, **kwargs): pass

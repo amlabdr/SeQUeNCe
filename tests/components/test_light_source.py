@@ -1,7 +1,8 @@
 from numpy import random
-from sequence.components.light_source import LightSource
+from sequence.components.light_source import LightSource, SPDCBellSource
 from sequence.kernel.timeline import Timeline
 from sequence.utils.encoding import polarization
+from math import isclose
 
 random.seed(0)
 
@@ -39,3 +40,48 @@ def test_light_source():
         index = int(qubit.name)
         assert state_list[index] == qubit.quantum_state.state
         assert time == index * (1e12 / FREQ)
+
+def test_spdc_bell_source():
+    FREQ = 1e8
+    MEAN = 0.1
+    BELL_STATE = "psi+"
+    STATE_VEC = SPDCBellSource.bell_state_map[BELL_STATE]
+    TOL = 1e-5
+
+    # Setup timeline and source
+    tl = Timeline()
+    source = SPDCBellSource("bell_src", tl, frequency=FREQ, mean_photon_num=MEAN, bell_state=BELL_STATE)
+    
+    # Attach receivers
+    receiver0 = Receiver(tl)
+    receiver1 = Receiver(tl)
+    receiver0.name = "recv0"
+    receiver1.name = "recv1"
+    source.add_receiver(receiver0)
+    source.add_receiver(receiver1)
+
+    # Emit N pulses and run
+    N = 1000
+    tl.init()
+    source.emit(N)
+    tl.run()
+
+    # Collect received photons
+    assert len(receiver0.log) == len(receiver1.log)
+    received = len(receiver0.log)
+    expected = MEAN * N
+
+    # Check that emission rate is statistically plausible
+    assert abs(received - expected) / expected < 0.3, "Unexpected number of emitted pairs"
+
+    # Check that all states match the Bell state
+    for (t0, photon0), (t1, photon1) in zip(receiver0.log, receiver1.log):
+        assert t0 == t1  # Coincident
+        state = photon0.quantum_state.state
+        assert isclose(abs(state[0]), abs(STATE_VEC[0]), rel_tol=TOL)
+        assert isclose(abs(state[1]), abs(STATE_VEC[1]), rel_tol=TOL)
+        assert isclose(abs(state[2]), abs(STATE_VEC[2]), rel_tol=TOL)
+        assert isclose(abs(state[3]), abs(STATE_VEC[3]), rel_tol=TOL)
+
+    print("Test passed: SPDCBellSource emits correct Bell states with expected frequency.")
+

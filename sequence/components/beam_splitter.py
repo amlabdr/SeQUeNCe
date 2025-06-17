@@ -64,7 +64,7 @@ class BeamSplitter(Entity):
             photon (Photon): photon to measure (must have polarization encoding)
 
         Side Effects:
-            May call get method of one receiver.
+            May call get method of one receiver.    
         """
 
         assert photon.encoding_type["name"] == "polarization", "Beamsplitter should only be used with polarization."
@@ -185,3 +185,35 @@ class FockBeamSplitter2(Entity):
         """
         for i in outputs:
             self.add_receiver(i)
+
+class FixedBasisBeamSplitter(Entity):
+    """
+    A simplified beam splitter that always measures in a fixed polarization basis.
+    """
+
+    def __init__(self, name: str, timeline, basis_index: int = 0, fidelity: float = 1.0):
+        """
+        Args:
+            name (str): name of the beam splitter.
+            timeline (Timeline): the simulation timeline.
+            basis_index (int): index of the polarization basis (0 for H/V, 1 for +/-).
+            fidelity (float): measurement fidelity (default 1).
+        """
+        super().__init__(name, timeline)
+        self.fidelity = fidelity
+        self.basis_index = basis_index  # 0: H/V, 1: diagonal
+        self._receivers = []  # will be filled externally
+
+    def init(self):
+        assert len(self._receivers) == 2, "BeamSplitter requires exactly 2 receivers."
+
+    def get(self, photon: Photon, **kwargs):
+        assert photon.encoding_type["name"] == "polarization", "Photon must be polarization encoded."
+
+        if self.get_generator().random() < self.fidelity:
+            # Perform measurement in fixed basis
+            basis = polarization["bases"][self.basis_index]
+            result = Photon.measure(basis, photon, self.get_generator())
+            self._receivers[result].get(photon)
+
+            
