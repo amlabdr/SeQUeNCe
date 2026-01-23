@@ -4,6 +4,7 @@ from typing import Final
 
 # speed of light in (m / pico second)
 SPEED_OF_LIGHT: Final = 2e-4
+SPEED_OF_LIGHT_M_PER_S = 299792458.0  # m/s (SI units)
 
 # |0> and |1>
 KET0: Final = (1, 0)
