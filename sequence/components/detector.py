@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from ..kernel.timeline import Timeline
 
 from .photon import Photon
-from .beam_splitter import BeamSplitter
+from .beam_splitter import BeamSplitter, PolarizingBeamSplitter
 from .switch import Switch
 from .interferometer import Interferometer
 from .circuit import Circuit
@@ -702,3 +702,123 @@ class FockDetector(Detector):
 
     def received_message(self, src: str, msg):
         pass
+
+
+class QSDetectorPolarizationStatic(QSDetector):
+    """QSDetector for measuring polarization in a static (non-changing) basis.
+    
+    Use cases:
+    - Static detector orientations in optical circuits
+    - Realistic detector modeling with measurement errors
+    - Scenarios where measurement basis doesn't change over time
+
+    Attributes:
+        name (str): label for detector instance.
+        timeline (Timeline): timeline for simulation.
+        basis_index (int): measurement basis (0=H/V, 1=+/-).
+        detectors (list[Detector]): list of two SPDs for orthogonal polarizations.
+        splitter (PolarizingBeamSplitter): internal static-basis beam splitter.
+        trigger_times (list[list[int]]): detection timestamps for each detector.
+    """
+
+    def __init__(self, name: str, timeline: "Timeline", basis_index: int = 0,
+                 PBS_fidelity: float = 1.0, mismeasure_prob: float = 0.0,
+                 detector_efficiency: float = 0.9, dark_count: float = 0,
+                 count_rate: float = 25e6, time_resolution: int = 150):
+        """Constructor for static-basis polarization detector.
+        
+        Args:
+            name (str): component name.
+            timeline (Timeline): simulation timeline.
+            basis_index (int): measurement basis (0=H/V, 1=+/-, default 0).
+            PBS_fidelity (float): beam splitter transmission probability (default 1.0).
+            mismeasure_prob (float): measurement error probability (default 0.0).
+            detector_efficiency (float): SPD detection efficiency (default 0.9).
+            dark_count (float): SPD dark count rate in Hz (default 0).
+            count_rate (float): SPD maximum count rate in Hz (default 25e6).
+            time_resolution (int): SPD time resolution in ps (default 150).
+        """
+        QSDetector.__init__(self, name, timeline)
+        
+        # Create two single photon detectors
+        self.detectors = []
+        for i in range(2):
+            d = Detector(
+                f"{name}.detector{i}",
+                timeline,
+                efficiency=detector_efficiency,
+                dark_count=dark_count,
+                count_rate=count_rate,
+                time_resolution=time_resolution
+            )
+            d.attach(self)
+            self.detectors.append(d)
+        
+        # Create static-basis beam splitter
+        self.splitter = PolarizingBeamSplitter(
+            f"{name}.splitter",
+            timeline,
+            basis_index=basis_index,
+            fidelity=PBS_fidelity,
+            mismeasure_prob=mismeasure_prob
+        )
+        self.splitter.add_receiver(self.detectors[0])
+        self.splitter.add_receiver(self.detectors[1])
+        
+        self.trigger_times = [[], []]
+        self.components = [self.splitter] + self.detectors
+
+    def init(self) -> None:
+        """Implementation of Entity interface (see base class)."""
+        assert len(self.detectors) == 2
+        super().init()
+
+    def get(self, photon: Photon, **kwargs) -> None:
+        """Method to receive a photon for measurement.
+        
+        Forwards the photon to the internal static-basis beam splitter.
+        
+        Args:
+            photon (Photon): photon to measure (must have polarization encoding).
+            
+        Side Effects:
+            Will call get method of attached beam splitter.
+        """
+        self.splitter.get(photon)
+
+    def get_photon_times(self) -> list[list[int]]:
+        """Get detection times and reset internal buffer.
+        
+        Returns:
+            list[list[int]]: detection times for each detector.
+            
+        Side Effects:
+            Clears internal trigger_times buffer.
+        """
+        times = self.trigger_times
+        self.trigger_times = [[], []]
+        return times
+
+    def set_basis_list(self, basis_list: list[int], start_time: int, frequency: float) -> None:
+        """Dummy method for interface compatibility.
+        
+        QSDetectorPolarizationStatic does not support time-varying basis.
+        This method exists only for API compatibility with QSDetectorPolarization.
+        
+        For dynamic basis switching, use QSDetectorPolarization instead.
+        
+        Args:
+            basis_list: ignored (basis is static and set at initialization).
+            start_time: ignored.
+            frequency: ignored.
+        """
+        pass
+
+    def update_splitter_params(self, arg_name: str, value: Any) -> None:
+        """Update beam splitter parameters.
+        
+        Args:
+            arg_name (str): name of attribute to update.
+            value (Any): new value for attribute.
+        """
+        self.splitter.__setattr__(arg_name, value)

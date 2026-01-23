@@ -349,3 +349,288 @@ def test_FockDetector():
 
     ratio = fock_detector.photon_counter / fock_detector.photon_counter2
     assert efficiency - 0.05 < ratio < efficiency + 0.05
+
+def test_QSDetectorPolarizationStatic_init():
+    """Test initialization with default parameters."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd_static", tl)
+    tl.init()
+    
+    assert qsd.name == "qsd_static"
+    assert len(qsd.detectors) == 2
+    assert qsd.splitter.basis_index == 0
+    assert qsd.splitter.fidelity == 1.0
+    assert qsd.splitter.mismeasure_prob == 0.0
+
+
+def test_QSDetectorPolarizationStatic_init_custom_params():
+    """Test initialization with custom parameters."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic(
+        "qsd_custom", tl,
+        basis_index=1,
+        PBS_fidelity=0.95,
+        mismeasure_prob=0.02,
+        detector_efficiency=0.85
+    )
+    tl.init()
+    
+    assert qsd.splitter.basis_index == 1
+    assert qsd.splitter.fidelity == 0.95
+    assert qsd.splitter.mismeasure_prob == 0.02
+    assert qsd.detectors[0].efficiency == 0.85
+
+
+def test_QSDetectorPolarizationStatic_HV_basis_measurement():
+    """Test measurement in H/V basis."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd_hv", tl, basis_index=0)
+    qsd.update_detector_params(0, "efficiency", 1)
+    qsd.update_detector_params(1, "efficiency", 1)
+    tl.init()
+    
+    # Send H-polarized photons
+    num_photons = 100
+    for i in range(num_photons):
+        tl.time = i * 1e6
+        photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
+        qsd.get(photon)
+    
+    trigger_times = qsd.get_photon_times()
+    # All H photons should go to detector 0
+    assert len(trigger_times[0]) == num_photons
+    assert len(trigger_times[1]) == 0
+
+
+def test_QSDetectorPolarizationStatic_diagonal_basis_measurement():
+    """Test measurement in +/- basis."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd_diag", tl, basis_index=1)
+    qsd.update_detector_params(0, "efficiency", 1)
+    qsd.update_detector_params(1, "efficiency", 1)
+    tl.init()
+    
+    # Send |+> polarized photons
+    num_photons = 100
+    for i in range(num_photons):
+        tl.time = i * 1e6
+        photon = Photon(f"plus_{i}", tl, quantum_state=polarization["bases"][1][0])
+        qsd.get(photon)
+    
+    trigger_times = qsd.get_photon_times()
+    # All |+> photons should go to detector 0
+    assert len(trigger_times[0]) == num_photons
+    assert len(trigger_times[1]) == 0
+
+
+def test_QSDetectorPolarizationStatic_basis_mismatch():
+    """Test quantum randomness when measuring in wrong basis."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd_mismatch", tl, basis_index=1)
+    qsd.update_detector_params(0, "efficiency", 1)
+    qsd.update_detector_params(1, "efficiency", 1)
+    tl.init()
+    
+    # Send H-polarized photons, measure in +/- basis
+    num_photons = 1000
+    for i in range(num_photons):
+        tl.time = i * 1e6
+        photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
+        qsd.get(photon)
+    
+    trigger_times = qsd.get_photon_times()
+    total = len(trigger_times[0]) + len(trigger_times[1])
+    ratio = len(trigger_times[0]) / total
+    
+    # Should be approximately 50/50
+    assert 0.45 < ratio < 0.55
+
+
+def test_QSDetectorPolarizationStatic_fidelity():
+    """Test beam splitter fidelity (photon loss)."""
+    tl = Timeline()
+    PBS_fidelity = 0.8
+    qsd = QSDetectorPolarizationStatic("qsd_fid", tl, basis_index=0, PBS_fidelity=PBS_fidelity)
+    qsd.update_detector_params(0, "efficiency", 1)
+    qsd.update_detector_params(1, "efficiency", 1)
+    tl.init()
+    
+    num_photons = 1000
+    for i in range(num_photons):
+        tl.time = i * 1e6
+        photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
+        qsd.get(photon)
+    
+    trigger_times = qsd.get_photon_times()
+    total_detected = len(trigger_times[0]) + len(trigger_times[1])
+    measured_fidelity = total_detected / num_photons
+    
+    assert abs(measured_fidelity - PBS_fidelity) < 0.05
+
+
+def test_QSDetectorPolarizationStatic_mismeasurement():
+    """Test measurement error probability."""
+    tl = Timeline()
+    mismeasure_prob = 0.1
+    qsd = QSDetectorPolarizationStatic(
+        "qsd_err", tl,
+        basis_index=0,
+        PBS_fidelity=1.0,
+        mismeasure_prob=mismeasure_prob
+    )
+    qsd.update_detector_params(0, "efficiency", 1)
+    qsd.update_detector_params(1, "efficiency", 1)
+    tl.init()
+    
+    num_photons = 1000
+    for i in range(num_photons):
+        tl.time = i * 1e6
+        photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
+        qsd.get(photon)
+    
+    trigger_times = qsd.get_photon_times()
+    # Errors cause H photons to go to detector 1
+    error_rate = len(trigger_times[1]) / num_photons
+    
+    assert abs(error_rate - mismeasure_prob) < 0.03
+
+
+def test_QSDetectorPolarizationStatic_combined_imperfections():
+    """Test realistic scenario with fidelity and measurement errors."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic(
+        "qsd_realistic", tl,
+        basis_index=0,
+        PBS_fidelity=0.9,
+        mismeasure_prob=0.05,
+        detector_efficiency=0.95
+    )
+    tl.init()
+    
+    num_photons = 1000
+    for i in range(num_photons):
+        tl.time = i * 1e6
+        photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
+        qsd.get(photon)
+    
+    trigger_times = qsd.get_photon_times()
+    total_detected = len(trigger_times[0]) + len(trigger_times[1])
+    
+    # Check overall detection rate (fidelity * efficiency)
+    expected_rate = 0.9 * 0.95
+    measured_rate = total_detected / num_photons
+    assert abs(measured_rate - expected_rate) < 0.05
+
+
+def test_QSDetectorPolarizationStatic_update_splitter_params():
+    """Test updating beam splitter parameters."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd", tl)
+    
+    qsd.update_splitter_params("fidelity", 0.88)
+    assert qsd.splitter.fidelity == 0.88
+    
+    qsd.update_splitter_params("mismeasure_prob", 0.03)
+    assert qsd.splitter.mismeasure_prob == 0.03
+
+
+def test_QSDetectorPolarizationStatic_update_detector_params():
+    """Test updating detector parameters."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd", tl)
+    
+    qsd.update_detector_params(0, "dark_count", 100)
+    assert qsd.detectors[0].dark_count == 100
+    assert qsd.detectors[1].dark_count == 0
+
+
+def test_QSDetectorPolarizationStatic_set_basis_list_dummy():
+    """Test that set_basis_list is a dummy method."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd", tl, basis_index=0)
+    
+    # Should not raise error, but should do nothing
+    qsd.set_basis_list([1, 0, 1], 0, 1e6)
+    
+    # Basis should remain unchanged
+    assert qsd.splitter.basis_index == 0
+
+
+def test_QSDetectorPolarizationStatic_get_photon_times_clears_buffer():
+    """Test that get_photon_times clears internal buffer."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd", tl)
+    qsd.update_detector_params(0, "efficiency", 1)
+    qsd.update_detector_params(1, "efficiency", 1)
+    tl.init()
+    
+    # Send some photons
+    for i in range(10):
+        tl.time = i * 1e6
+        photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
+        qsd.get(photon)
+    
+    # Get times (should clear buffer)
+    times1 = qsd.get_photon_times()
+    assert len(times1[0]) > 0
+    
+    # Get again (should be empty)
+    times2 = qsd.get_photon_times()
+    assert times2 == [[], []]
+
+
+def test_QSDetectorPolarizationStatic_trigger_mechanism():
+    """Test detector trigger mechanism."""
+    tl = Timeline()
+    qsd = QSDetectorPolarizationStatic("qsd", tl)
+    tl.init()
+    
+    # Manually trigger detectors
+    qsd.trigger(qsd.detectors[0], {'time': 100})
+    qsd.trigger(qsd.detectors[1], {'time': 200})
+    qsd.trigger(qsd.detectors[0], {'time': 300})
+    
+    trigger_times = qsd.trigger_times
+    assert trigger_times[0] == [100, 300]
+    assert trigger_times[1] == [200]
+
+
+def test_QSDetectorPolarizationStatic_vs_dynamic():
+    """Test that static detector behaves differently from dynamic detector."""
+    tl = Timeline()
+    
+    # Static detector (always H/V)
+    qsd_static = QSDetectorPolarizationStatic("static", tl, basis_index=0)
+    qsd_static.update_detector_params(0, "efficiency", 1)
+    qsd_static.update_detector_params(1, "efficiency", 1)
+    
+    # Dynamic detector (switches between H/V and +/-)
+    qsd_dynamic = QSDetectorPolarization("dynamic", tl)
+    qsd_dynamic.update_detector_params(0, "efficiency", 1)
+    qsd_dynamic.update_detector_params(1, "efficiency", 1)
+    basis_list = [0] * 50 + [1] * 50  # First 50 H/V, then 50 +/-
+    qsd_dynamic.set_basis_list(basis_list, 0, 1e5)
+    
+    tl.init()
+    
+    frequency = 1e5
+    # Send H-polarized photons
+    for i in range(100):
+        tl.time = i * 1e12 / frequency
+        photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
+        qsd_static.get(photon)
+        qsd_dynamic.get(photon)
+    
+    static_times = qsd_static.get_photon_times()
+    dynamic_times = qsd_dynamic.get_photon_times()
+    
+    # Static: all H photons go to detector 0
+    assert len(static_times[0]) == 100
+    assert len(static_times[1]) == 0
+    
+    # Dynamic: first 50 to detector 0, last 50 split randomly
+    assert len(dynamic_times[0]) >= 50
+
+import pytest
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
