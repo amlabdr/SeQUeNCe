@@ -185,3 +185,66 @@ class FockBeamSplitter2(Entity):
         """
         for i in outputs:
             self.add_receiver(i)
+
+
+class PolarizingBeamSplitter(Entity):
+    """Class modeling a polarizing beam splitter with fixed orientation.
+
+    Simulates a polarization beam splitter (PBS) that always measures in the same basis.
+    Unlike the time-varying BeamSplitter used for BB84 protocols, this PBS has a fixed
+    measurement orientation and includes error modeling for realistic simulations.
+    
+    Attributes:
+        name (str): label for beam splitter instance.
+        timeline (Timeline): timeline for simulation.
+        basis_index (int): index of measurement basis (0 for H/V, 1 for +/-).
+        fidelity (float): probability of successfully transmitting a received photon.
+        mismeasure_prob (float): probability of measurement error (bit flip).
+    """
+
+    def __init__(self, name: str, timeline: "Timeline", basis_index: int = 0, 
+                 fidelity: float = 1.0, mismeasure_prob: float = 0.0):
+        """Constructor for the polarizing beam splitter class.
+
+        Args:
+            name (str): name of the beam splitter instance.
+            timeline (Timeline): simulation timeline.
+            basis_index (int): polarization basis index (0 for H/V, 1 for +/-, default 0).
+            fidelity (float): probability of transmitting a received photon (default 1.0).
+            mismeasure_prob (float): probability of bit flip error in measurement (default 0.0).
+        """
+        Entity.__init__(self, name, timeline)
+        self.fidelity = fidelity
+        self.basis_index = basis_index
+        self.mismeasure_prob = mismeasure_prob
+
+    def init(self) -> None:
+        """Implementation of Entity interface (see base class)."""
+        assert len(self._receivers) == 2, \
+            "PolarizingBeamSplitter requires exactly 2 receivers."
+
+    def get(self, photon: Photon, **kwargs) -> None:
+        """Method to receive a photon for measurement.
+
+        Measures the photon in the fixed basis and routes it to the appropriate receiver.
+        Includes optional measurement errors via the mismeasure_prob parameter.
+
+        Args:
+            photon (Photon): photon to measure (must have polarization encoding).
+
+        Side Effects:
+            May call get method of one receiver based on measurement result.
+        """
+        assert photon.encoding_type["name"] == "polarization", \
+            "PolarizingBeamSplitter requires polarization encoding."
+
+        if self.get_generator().random() < self.fidelity:
+            # Measure in fixed basis
+            basis = polarization["bases"][self.basis_index]
+            result = Photon.measure(basis, photon, self.get_generator())
+            
+            # Apply measurement error (bit flip)
+            if self.get_generator().random() < self.mismeasure_prob:
+                result = 1 - result
+            
+            self._receivers[result].get(photon)
