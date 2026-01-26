@@ -109,7 +109,8 @@ class WavePlate(Entity):
         if len(full_state) == 2:
             # Single-photon polarization state (2D)
             new_state = dot(self.unitary, full_state)
-            photon.set_state(new_state.tolist())
+            new_state_tuple = tuple(complex(x) for x in new_state)
+            photon.set_state(new_state_tuple)
             
         elif len(full_state) == 4:
             # Entangled two-photon state (4D)

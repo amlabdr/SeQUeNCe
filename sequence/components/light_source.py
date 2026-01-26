@@ -12,6 +12,7 @@ from ..kernel.event import Event
 from ..kernel.process import Process
 from ..utils.encoding import polarization, fock
 from ..utils import log
+import numpy as np
 
 
 class LightSource(Entity):
@@ -95,6 +96,171 @@ class LightSource(Entity):
                 self.photon_counter += 1
 
             time += period
+
+
+class SPDCBellSource(LightSource):
+    """
+    A light source that emits entangled photon pairs in Bell states using
+    spontaneous parametric down-conversion (SPDC).
+
+    This component models a pulsed laser with an SPDC crystal that generates
+    entangled photon pairs at a specified frequency. Each photon pair is emitted
+    in one of the four maximally-entangled Bell states (|Φ±⟩, |Ψ±⟩).
+
+    The source implements realistic SPDC physics:
+    - Energy-conserving wavelength correlation (lambda_signal * lambda_idler = lambda_pump²)
+    - Gaussian wavelength distribution around central value
+    - Configurable photon statistics (thermal or Poisson)
+
+    Attributes:
+        bell_state_label (str): Label of the Bell state ("phi+", "phi-", "psi+", "psi-").
+        bell_state (tuple): 4D state vector of the selected Bell state in
+            computational basis |HH⟩, |HV⟩, |VH⟩, |VV⟩.
+        wavelengths (list[float]): Two-element list [lambda_min, lambda_max] defining
+            wavelength range in nm for energy-conserving sampling.
+        photon_statistics (str): Distribution type ("thermal" or "poisson").
+    """
+
+    bell_state_map = {
+        "phi+": (1 / sqrt(2), 0, 0, 1 / sqrt(2)),
+        "phi-": (1 / sqrt(2), 0, 0, -1 / sqrt(2)),
+        "psi+": (0, 1 / sqrt(2), 1 / sqrt(2), 0),
+        "psi-": (0, 1 / sqrt(2), -1 / sqrt(2), 0)
+    }
+
+    def __init__(self, name, timeline, wavelengths=None, frequency=8e7, mean_photon_num=0.1,
+                 encoding_type=polarization, phase_error=0, bandwidth=0, photon_statistics="thermal", bell_state="psi+"):
+        """
+        Constructor for SPDCBellSource.
+
+        Args:
+            name (str): Name of the source instance.
+            timeline (Timeline): Simulation timeline.
+            wavelengths (list[float], optional): Two-element list [lambda_min, lambda_max] 
+                defining wavelength sampling range in nm. If None, defaults to [1550, 1550].
+            frequency (float): Pulse repetition frequency in Hz (default 80 MHz).
+            mean_photon_num (float): Mean number of photon pairs per pulse (default 0.1).
+            encoding_type (dict): Photon encoding scheme (default polarization encoding).
+            phase_error (float): Phase flip probability (currently unused, default 0).
+            bandwidth (float): Wavelength range for Gaussian sampling in nm (default 0).
+                The standard deviation is bandwidth/3.
+            photon_statistics (str): Photon pair distribution type (default "thermal").
+                Options: "thermal" (Bose-Einstein) or "poisson" (coherent).
+            bell_state (str): Bell state to emit (default "psi-").
+                Options: "phi+" (|Φ⁺⟩), "phi-" (|Φ⁻⟩), "psi+" (|Ψ⁺⟩), "psi-" (|Ψ⁻⟩).
+
+        Raises:
+            AssertionError: If not connected to exactly 2 receivers (checked in init()).
+        """
+        super().__init__(name, timeline, frequency, 0, bandwidth, mean_photon_num, encoding_type, phase_error)
+        self.wavelengths = wavelengths
+        self.photon_statistics = photon_statistics
+        if self.wavelengths is None or len(self.wavelengths) != 2:
+            self.set_wavelength()
+        self.bell_state_label = bell_state
+        self.bell_state = self.bell_state_map[bell_state]
+
+    def init(self):
+        assert len(self._receivers) == 2, "SPDCBellSource source must connect to 2 receivers."
+
+    def sample_photon_pairs(self):
+        """Sample number of photon pairs from configured distribution.
+
+        Uses either thermal (Bose-Einstein) or Poisson statistics based on
+        the photon_statistics attribute.
+
+        Returns:
+            int: Number of photon pairs to emit (>= 0).
+
+        Raises:
+            ValueError: If photon_statistics is not "thermal" or "poisson".
+        """
+        if self.photon_statistics == "thermal":
+            # Thermal (Bose-Einstein) distribution
+            p = 1 / (1 + self.mean_photon_num)
+            return self.get_generator().geometric(p) - 1
+        
+        elif self.photon_statistics == "poisson":
+            # Poisson distribution (coherent state)
+            return self.get_generator().poisson(self.mean_photon_num)
+        
+        else:
+            raise ValueError(f"Unknown photon_statistics: {self.photon_statistics}")
+    
+    def emit(self, num_pulses=1):
+        """
+        Emit entangled photon pairs in the specified Bell state.
+
+        Each pulse emits a random number of photon pairs sampled from the
+        configured distribution (thermal or Poisson). Photons are sent to 
+        the two connected receivers with appropriate time delays.
+
+        Wavelength correlation: For each pair, signal and idler wavelengths
+        are sampled to satisfy energy conservation (lambda_signal * lambda_idler = lambda_pump^2).
+
+        Timing: Pulses are spaced by 1/frequency. Photon pairs within a pulse
+        are sent at the same time.
+
+        Args:
+            num_pulses (int): Number of emission pulses to generate (default 1).
+
+        Side Effects:
+            - Schedules photon arrival events at connected receivers
+            - Increments self.photon_counter for each emitted pair
+            - Advances internal time by num_pulses * (1/frequency)
+        """
+        time = self.timeline.now()
+        period = int(round(1e12 / self.frequency))
+
+        lam_min, lam_max = self.wavelengths
+        lam0 = 0.5 * (lam_min + lam_max)
+        delta_max = 0.5 * (lam_max - lam_min)
+        sigma = delta_max / 3
+
+        for _ in range(num_pulses):
+            num_pairs = self.sample_photon_pairs()
+            for _ in range(num_pairs):
+                delta = sigma * self.get_generator().standard_normal()
+                delta = np.clip(delta, -delta_max, delta_max)
+
+                lambda_signal = lam0 + delta
+                lambda_idler  = lam0 * lam0 / lambda_signal
+
+                new_photon0 = Photon("signal", self.timeline,
+                                     wavelength=lambda_signal,
+                                     location=self,
+                                     encoding_type=self.encoding_type)
+                new_photon1 = Photon("idler", self.timeline,
+                                     wavelength=lambda_idler,
+                                     location=self,
+                                     encoding_type=self.encoding_type)
+
+                new_photon0.combine_state(new_photon1)
+                new_photon0.set_state(self.bell_state)
+                self.send_photons(time, [new_photon0, new_photon1])
+                self.photon_counter += 1
+            time += period
+    
+    def send_photons(self, time, photons: list["Photon"]):
+        """
+        Dispatch photon pair to the connected receivers.
+
+        Args:
+            time (float): Emission time in ps.
+            photons (list): List of two Photon objects.
+        """
+        log.logger.debug("SPDC source {} sending photons to {} at time {}".format(
+            self.name, self._receivers, time
+        ))
+        assert len(photons) == 2
+        for dst, photon in zip(self._receivers, photons):
+            process = Process(dst, "get", [photon])
+            event = Event(int(round(time)), process)
+            self.timeline.schedule(event)
+
+    def set_wavelength(self, wavelength1=1550, wavelength2=1550):
+        """Method to set the wavelengths of photons emitted in two output modes."""
+        self.wavelengths = [wavelength1, wavelength2]
 
 
 class SPDCSource(LightSource):
