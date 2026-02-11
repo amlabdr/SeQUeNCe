@@ -182,7 +182,6 @@ class Node(Entity):
             src (str): name of node where qubit was sent from.
             qubit (any): transmitted qubit. Typically a Photon object.
         """
-
         self.components[self.first_component_name].get(qubit)
 
     def get_components_by_type(self, component_type: str | type) -> list:

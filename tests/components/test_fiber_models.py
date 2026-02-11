@@ -1009,6 +1009,574 @@ def test_multi_section_lengths_sum_validation():
         )
         tl.init()
 
+
+# ============================================================================
+# Helper Function for Fig 7/10 Tests
+# ============================================================================
+
+import numpy as np
+from sequence.components.fiber_models import get_fiber_attenuation_per_m
+
+def calculate_launching_power_mW(
+    output_power_W: float,
+    wavelength_nm: float,
+    fiber_length_m: float
+) -> float:
+    """
+    Calculate required launching power to achieve desired output power.
+    
+    Used for Fig 7 scenario: maintain 1 μW at receiver by adjusting launcher.
+    P_out = P_in * exp(-alpha * L)
+    P_in = P_out * exp(alpha * L)
+    """
+    h = 6.62607015e-34  # Planck constant
+    c = 299792458  # Speed of light
+    
+    # Get fiber attenuation at this wavelength
+    alpha_per_m = get_fiber_attenuation_per_m(wavelength_nm)
+    
+    # Photon energy
+    E_photon = h * c / (wavelength_nm * 1e-9)
+    
+    # Convert output power to photons/s
+    output_photons_s = output_power_W / E_photon
+    
+    # Calculate required launching rate (compensate for fiber loss)
+    launching_photons_s = output_photons_s * np.exp(alpha_per_m * fiber_length_m)
+    
+    # Convert back to Watts, then mW
+    launching_W = launching_photons_s * E_photon
+    return launching_W * 1e3
+
+# ============================================================================
+# Test 15: Classical Coexistence - Raman Scattering Constants
+# ============================================================================
+
+
+def test_raman_scattering_constants_table2():
+    """
+    Test that Raman scattering constants match Burenkov et al. Table 2.
+    
+    Reference: Burenkov et al., "Synchronization and coexistence in quantum networks,"
+               Optics Express 31, 11431 (2023), Table 2.
+    
+    Beta constants in units of 10^-23 m^-1 Hz^-1 for 100 GHz DWDM channel.
+    """
+    from sequence.components.fiber_models import RamanScatteringConstants
+    
+    raman = RamanScatteringConstants()
+    
+    # Test each wavelength pair from Table 2
+    test_cases = [
+        # (classical_nm, quantum_nm, expected_beta_FS, expected_beta_BS)
+        (1270, 1550, 0.058e-23, 0.061e-23),  # Best option (lowest noise)
+        (1310, 1550, 0.421e-23, 0.449e-23),  # 7x more noise
+        (1330, 1550, 0.699e-23, 0.745e-23),  # 12x more noise
+        (1490, 1550, 3.69e-23, 3.75e-23),    # 64x more noise (worst)
+    ]
+    
+    for classical_nm, quantum_nm, expected_FS, expected_BS in test_cases:
+        beta_FS, beta_BS = raman.get_beta(classical_nm, quantum_nm)
+        
+        assert abs(beta_FS - expected_FS) < 1e-26, \
+            f"Beta_FS({classical_nm}→{quantum_nm}): {beta_FS:.3e} != {expected_FS:.3e}"
+        assert abs(beta_BS - expected_BS) < 1e-26, \
+            f"Beta_BS({classical_nm}→{quantum_nm}): {beta_BS:.3e} != {expected_BS:.3e}"
+    
+    # Test wavelength detuning effect (1270 nm is 64x better than 1490 nm)
+    beta_FS_1270, _ = raman.get_beta(1270, 1550)
+    beta_FS_1490, _ = raman.get_beta(1490, 1550)
+    
+    ratio = beta_FS_1490 / beta_FS_1270
+    assert 60 < ratio < 68, f"Noise ratio 1490/1270: {ratio:.1f} (expected ~64x)"
+
+
+# ============================================================================
+# Test 16: Classical Coexistence - Noise Rate vs Power (Fig 3)
+# ============================================================================
+
+def test_raman_noise_rate_vs_classical_power():
+    """
+    Validate Raman noise linear scaling with classical launch power.
+
+    Reference:
+        Burenkov et al., Opt. Express 31, 11431 (2023), Fig. 3
+
+    What Fig. 3 shows:
+        - Noise rate ∝ classical photon rate
+        - Fixed fiber length (25 km)
+        - Separate FS and BS curves (we test FS only)
+        - Order-of-magnitude agreement (not exact matching)
+
+    This test verifies:
+        1) Linear scaling of FS Raman noise vs power
+        2) Correct absolute order of magnitude at 10^14 photons/s
+    """
+
+    tl = Timeline()
+
+    # Fiber spec: best-case configuration from the paper
+    spec = FiberSpec(
+        classical_coexist_enabled=True,
+        classical_wavelength_nm=1270.0,
+        quantum_wavelength_nm=1550.0,
+        quantum_bandwidth_Hz=100e9,
+        classical_power_mW=1.0,  # overridden below
+    )
+
+    # Fig. 3 x-axis values converted to mW at 1270 nm
+    # 10^13 → 0.00156 mW
+    # 10^14 → 0.0156 mW
+    # 10^15 → 0.156  mW
+    powers_mW = [0.00156, 0.0156, 0.156]
+
+    fs_noise_rates = []
+
+    for p_mW in powers_mW:
+        spec.classical_power_mW = p_mW
+
+        channel = fiberQuantumChannel(
+            name=f"raman_test_{p_mW:.3e}_mW",
+            timeline=tl,
+            attenuation=0.17 / 1000.0,  # ~0.17 dB/km at 1550 nm
+            distance=25_000.0,
+            sections=[FiberSection(25_000.0, spec)],
+        )
+
+        tl.init()
+
+        # Use FORWARD scattering only (matches one Fig. 3 curve)
+        fs_noise_rates.append(channel.raman_noise_rate_FS_Hz)
+
+    # ------------------------------------------------------------------
+    # 1) Linearity test: noise  power
+    # ------------------------------------------------------------------
+    for i in range(1, len(powers_mW)):
+        expected_ratio = powers_mW[i] / powers_mW[0]
+        actual_ratio = fs_noise_rates[i] / fs_noise_rates[0]
+
+        assert abs(actual_ratio - expected_ratio) < 0.1 * expected_ratio, (
+            f"Non-linear Raman scaling: "
+            f"P={powers_mW[i]:.3e} mW → ratio={actual_ratio:.2f}, "
+            f"expected={expected_ratio:.2f}"
+        )
+
+    # ------------------------------------------------------------------
+    # 2) Absolute magnitude sanity check (10^14 photons/s)
+    # ------------------------------------------------------------------
+    noise_at_1e14 = fs_noise_rates[1]  # middle point
+
+    # Fig. 3 shows ~2e4 photons/s for FS @ 1270 nm, 25 km
+    assert 1e4 < noise_at_1e14 < 4e4, (
+        f"FS Raman noise at 10^14 ph/s: {noise_at_1e14:.2e} photons/s "
+        f"(expected ~2e4)"
+    )
+
+# ============================================================================
+# Test 17: Classical Coexistence - Noise Rate vs Fiber Length (Fig 4)
+# ============================================================================
+
+def test_raman_noise_rate_vs_fiber_length():
+    """
+    Validate Raman noise vs fiber length against Burenkov et al., Fig. 4.
+
+    Paper facts:
+    - Fixed LAUNCHING power: 10^14 photons/s
+    - FS and BS are plotted separately (NOT summed)
+    - Curves saturate with length due to effective length
+    """
+
+    tl = Timeline()
+
+    fiber_lengths_km = [1, 6, 12, 25]
+
+    from sequence.constants import SPEED_OF_LIGHT_M_PER_S, PLANCK_CONSTANT
+
+    # Fixed launching power from Fig. 4 (10^14 photons/s)
+    E_photon = PLANCK_CONSTANT * SPEED_OF_LIGHT_M_PER_S / (1270.0 * 1e-9)
+    launching_power_mW = 1e14 * E_photon * 1e3
+
+    fs_1270 = []
+    bs_1270 = []
+    fs_1310 = []
+    bs_1310 = []
+
+    for L_km in fiber_lengths_km:
+        L_m = L_km * 1000.0
+
+        spec_1270 = FiberSpec(
+            classical_coexist_enabled=True,
+            classical_wavelength_nm=1270.0,
+            quantum_wavelength_nm=1550.0,
+            quantum_bandwidth_Hz=100e9,
+            classical_power_mW=launching_power_mW,
+        )
+
+        spec_1310 = FiberSpec(
+            classical_coexist_enabled=True,
+            classical_wavelength_nm=1310.0,
+            quantum_wavelength_nm=1550.0,
+            quantum_bandwidth_Hz=100e9,
+            classical_power_mW=launching_power_mW,
+        )
+
+        ch_1270 = fiberQuantumChannel(
+            name=f"raman_1270_{L_km}km",
+            timeline=tl,
+            attenuation=0.0002,  # required by constructor
+            distance=L_m,
+            sections=[FiberSection(L_m, spec_1270)],
+        )
+
+        ch_1310 = fiberQuantumChannel(
+            name=f"raman_1310_{L_km}km",
+            timeline=tl,
+            attenuation=0.0002,
+            distance=L_m,
+            sections=[FiberSection(L_m, spec_1310)],
+        )
+
+        tl.init()
+
+        fs_1270.append(ch_1270.raman_noise_rate_FS_Hz)
+        bs_1270.append(ch_1270.raman_noise_rate_BS_Hz)
+        fs_1310.append(ch_1310.raman_noise_rate_FS_Hz)
+        bs_1310.append(ch_1310.raman_noise_rate_BS_Hz)
+
+    # --------------------------------------------------
+    # 1) FS and BS increase with length and saturate
+    # --------------------------------------------------
+    for arr, label in [
+        (fs_1270, "FS 1270"),
+        (bs_1270, "BS 1270"),
+        (fs_1310, "FS 1310"),
+        (bs_1310, "BS 1310"),
+    ]:
+        for i in range(1, len(arr)):
+            assert arr[i] >= arr[i - 1], f"{label} not monotonic with length"
+
+    # --------------------------------------------------
+    # 2) 1310 nm produces more noise than 1270 nm (Table 2 trend)
+    # --------------------------------------------------
+    for i, L_km in enumerate(fiber_lengths_km):
+        assert fs_1310[i] > fs_1270[i], f"FS 1310 <= FS 1270 at {L_km} km"
+        assert bs_1310[i] > bs_1270[i], f"BS 1310 <= BS 1270 at {L_km} km"
+
+    # --------------------------------------------------
+    # 3) Absolute magnitude check at 25 km (Fig. 4)
+    # --------------------------------------------------
+    idx_25 = fiber_lengths_km.index(25)
+
+    # From Fig. 4 (order-of-magnitude read-off)
+    # FS 1270 ~ (3–4)×10^4, BS 1270 ~ (4–4)×10^4
+    assert 2e4 < fs_1270[idx_25] < 4e4, (
+        f"FS 1270 @25 km out of range: {fs_1270[idx_25]:.2e}"
+    )
+    assert 4e4 < bs_1270[idx_25] < 5e5, (
+        f"BS 1270 @25 km out of range: {bs_1270[idx_25]:.2e}"
+    )
+
+# ============================================================================
+# Test 18: Classical Coexistence - Coexistence Limit (Fig 10)
+# ============================================================================
+
+def test_classical_coexistence_fiber_length_limit():
+    """
+    Validate coexistence limit under constant classical OUTPUT power
+    against Burenkov et al., Fig. 7 / Fig. 10.
+
+    - Fixed OUTPUT power: 1 μW at receiver
+    - Launching power increases with length
+    - TOTAL Raman noise = FS + BS
+    """
+
+    tl = Timeline()
+
+    classical_output_power_W = 1e-6  # 1 μW at receiver
+    quantum_wavelength_nm = 1550.0
+    quantum_bandwidth_Hz = 100e9
+
+    test_lengths_km = [1, 6, 12, 25]
+
+    # Approximate values read from Fig. 7 (model curve, order-of-magnitude)
+    expected_noise_fig7 = {
+        1: 3e2,
+        6: 3e3,
+        12: 9e3,
+        25: 2e4
+    }
+
+    noise_1270 = {}
+
+    for L_km in test_lengths_km:
+        L_m = L_km * 1000.0
+
+        launching_power_mW = calculate_launching_power_mW(
+            output_power_W=classical_output_power_W,
+            wavelength_nm=1270.0,
+            fiber_length_m=L_m,
+        )
+
+        spec = FiberSpec(
+            classical_coexist_enabled=True,
+            classical_wavelength_nm=1270.0,
+            quantum_wavelength_nm=quantum_wavelength_nm,
+            quantum_bandwidth_Hz=quantum_bandwidth_Hz,
+            classical_power_mW=launching_power_mW,
+        )
+
+        ch = fiberQuantumChannel(
+            name=f"coexist_1270_{L_km}km",
+            timeline=tl,
+            attenuation=0.0002,
+            distance=L_m,
+            sections=[FiberSection(L_m, spec)],
+        )
+
+        tl.init()
+        noise_1270[L_km] = ch.raman_noise_rate_Hz
+
+    # --------------------------------------------------
+    # 1) Noise must increase strongly with fiber length
+    # --------------------------------------------------
+    for i in range(1, len(test_lengths_km)):
+        L_prev = test_lengths_km[i - 1]
+        L_curr = test_lengths_km[i]
+        assert noise_1270[L_curr] > noise_1270[L_prev], (
+            f"Noise should increase: {L_curr} km > {L_prev} km"
+        )
+
+    # --------------------------------------------------
+    # 2) Absolute scale sanity check (order-of-magnitude)
+    # --------------------------------------------------
+    for L_km in [6, 12, 25]:
+        measured = noise_1270[L_km]
+        expected = expected_noise_fig7[L_km]
+
+        # Allow wide tolerance: paper curves are model projections
+        assert 0.5 * expected < measured < 2.0 * expected, (
+            f"Noise at {L_km} km: {measured:.2e}, expected ~{expected:.2e}"
+        )
+
+    # --------------------------------------------------
+    # 3) 1270 nm is significantly better than 1490 nm
+    # --------------------------------------------------
+    L_test_m = 25_000.0
+
+    launch_1270 = calculate_launching_power_mW(
+        classical_output_power_W, 1270.0, L_test_m
+    )
+    launch_1490 = calculate_launching_power_mW(
+        classical_output_power_W, 1490.0, L_test_m
+    )
+
+    spec_1270 = FiberSpec(
+        classical_coexist_enabled=True,
+        classical_wavelength_nm=1270.0,
+        quantum_wavelength_nm=1550.0,
+        quantum_bandwidth_Hz=100e9,
+        classical_power_mW=launch_1270,
+    )
+
+    spec_1490 = FiberSpec(
+        classical_coexist_enabled=True,
+        classical_wavelength_nm=1490.0,
+        quantum_wavelength_nm=1550.0,
+        quantum_bandwidth_Hz=100e9,
+        classical_power_mW=launch_1490,
+    )
+
+    ch_1270 = fiberQuantumChannel(
+        "1270", tl, 0.0002, L_test_m, sections=[FiberSection(L_test_m, spec_1270)]
+    )
+    ch_1490 = fiberQuantumChannel(
+        "1490", tl, 0.0002, L_test_m, sections=[FiberSection(L_test_m, spec_1490)]
+    )
+
+    tl.init()
+
+    ratio = ch_1490.raman_noise_rate_Hz / ch_1270.raman_noise_rate_Hz
+
+    # Expect strong degradation for 1490 nm (>>10× worse)
+    assert ratio > 30, f"1490/1270 noise ratio too small: {ratio:.1f}"
+
+
+# ============================================================================
+# Test 19: Classical Coexistence - Multi-section with Mixed Classical Channels
+# ============================================================================
+
+def test_multi_section_classical_coexistence():
+    """
+    Test realistic scenario: Multi-section fiber with classical channels
+    enabled only in certain sections.
+    
+    Scenario: 
+    - Section 1: 10 km, no classical (dark fiber)
+    - Section 2: 15 km, with 1270 nm classical @ 0.0156 mW
+    - Section 3: 10 km, no classical (dark fiber)
+    
+    Total noise should only come from Section 2.
+    """
+    tl = Timeline()
+    
+    sections = [
+        # Section 1: Dark fiber (no classical)
+        FiberSection(10000.0, FiberSpec(
+            classical_coexist_enabled=False
+        )),
+        
+        # Section 2: Classical + quantum coexistence
+        FiberSection(15000.0, FiberSpec(
+            classical_coexist_enabled=True,
+            classical_wavelength_nm=1270.0,
+            quantum_wavelength_nm=1550.0,
+            quantum_bandwidth_Hz=100e9,
+            classical_power_mW=0.0156  # Match paper's 10^14 photons/s
+        )),
+        
+        # Section 3: Dark fiber (no classical)
+        FiberSection(10000.0, FiberSpec(
+            classical_coexist_enabled=False
+        )),
+    ]
+    
+    multi_channel = fiberQuantumChannel(
+        name="multi_coexist",
+        timeline=tl,
+        attenuation=0.0002,
+        distance=35000.0,  # 35 km total
+        sections=sections
+    )
+    tl.init()
+    
+    # Test 1: Noise should be non-zero (Section 2 contributes)
+    assert multi_channel.raman_noise_rate_Hz > 0, \
+        "Should have noise from Section 2"
+    
+    # Test 2: Noise should match single 15 km section
+    single_channel = fiberQuantumChannel(
+        name="single_15km",
+        timeline=tl,
+        attenuation=0.0002,
+        distance=15000.0,
+        sections=[FiberSection(15000.0, sections[1].spec)]
+    )
+    tl.init()
+    
+    # Noise should be similar (within tolerance due to pre/post-section attenuation)
+    ratio = multi_channel.raman_noise_rate_Hz / single_channel.raman_noise_rate_Hz
+    assert 0.9 < ratio < 1.1, \
+        f"Multi-section noise mismatch: {ratio:.2f} (expected ~1.0)"
+    
+    # Test 3: If all sections are dark, noise should be zero
+    dark_sections = [
+        FiberSection(10000.0, FiberSpec(classical_coexist_enabled=False)),
+        FiberSection(15000.0, FiberSpec(classical_coexist_enabled=False)),
+        FiberSection(10000.0, FiberSpec(classical_coexist_enabled=False)),
+    ]
+    
+    dark_channel = fiberQuantumChannel(
+        name="all_dark",
+        timeline=tl,
+        attenuation=0.0002,
+        distance=35000.0,
+        sections=dark_sections
+    )
+    tl.init()
+    
+    assert dark_channel.raman_noise_rate_Hz == 0.0, \
+        "Dark fiber should have zero Raman noise"
+
+# ============================================================================
+# Test 20: Classical Coexistence - Noise Photon Generation
+# ============================================================================
+
+def test_raman_noise_photon_generation():
+    """
+    Test that noise photons are actually generated and transmitted.
+    
+    This tests the full pipeline:
+    1. _schedule_next_noise_photon() schedules Poisson-distributed events
+    2. _generate_and_transmit_noise_photon() creates random-polarization photons
+    3. Noise photons are transmitted through channel (experience loss, PMD, CD)
+    4. Noise photons arrive at receiver
+    
+    Use higher power to generate sufficient noise in short runtime
+    """
+    class FakeNode(Node):
+        def __init__(self, name, tl):
+            Node.__init__(self, name, tl)
+            self.received_photons = []
+            self.noise_photon_count = 0
+            self.signal_photon_count = 0
+            self.generator = np.random.default_rng(SEED)
+        
+        def receive_qubit(self, src, photon):
+            self.received_photons.append({
+                'time': self.timeline.now(),
+                'name': photon.name,
+                'is_noise': getattr(photon, 'is_raman_noise', False)
+            })
+            
+            if getattr(photon, 'is_raman_noise', False):
+                self.noise_photon_count += 1
+            else:
+                self.signal_photon_count += 1
+        
+        def get_generator(self):
+            return self.generator
+    
+    tl = Timeline()
+    
+    # High noise scenario: 1490 nm classical @ 1 mW, 1 km fiber
+    # Expected noise: ~2e6 photons/s
+    spec_high_noise = FiberSpec(
+        classical_coexist_enabled=True,
+        classical_wavelength_nm=1490.0,  # Worst case - 64x more noise
+        quantum_wavelength_nm=1550.0,
+        quantum_bandwidth_Hz=100e9,
+        classical_power_mW=1.0  # 1 mW for measurable noise in short time
+    )
+    
+    channel = fiberQuantumChannel(
+        name="noisy_channel",
+        timeline=tl,
+        attenuation=0.0,  # No loss for this test
+        distance=1000.0,  # 1 km
+        sections=[FiberSection(1000.0, spec_high_noise)]
+    )
+    
+    sender = FakeNode("sender", tl)
+    receiver = FakeNode("receiver", tl)
+    sender.set_seed(SEED)
+    
+    tl.init()
+    channel.set_ends(sender, receiver.name)
+    
+    # Run simulation for 10 microseconds (long enough to see multiple noise photons)
+    tl.stop_time = int(1e8)  # 10 μs in picoseconds
+    tl.run()
+    
+    # Test 1: Noise photons should be generated
+    assert receiver.noise_photon_count > 0, \
+        f"No noise photons received (expected > 0)"
+    
+    # Test 2: Noise rate should match theoretical prediction
+    runtime_s = tl.stop_time * 1e-12
+    measured_rate = receiver.noise_photon_count / runtime_s
+    expected_rate = channel.raman_noise_rate_Hz
+
+    ratio = measured_rate / expected_rate
+    assert 0.9 < ratio < 1.1, \
+        f"Noise rate mismatch: {measured_rate:.2e} vs {expected_rate:.2e} photons/s"
+    
+    # Test 3: Noise photons should have random polarization
+    # (Cannot test directly, but verify they are marked correctly)
+    for photon_info in receiver.received_photons:
+        if photon_info['is_noise']:
+            assert photon_info['name'] == 'raman_noise', \
+                "Noise photons should be named 'raman_noise'"
+            
 # ============================================================================
 # Run Tests
 # ============================================================================

@@ -10,6 +10,7 @@ from ..components.wave_plate import WavePlate
 from ..components.light_source import SPDCBellSource
 from ..utils.encoding import polarization
 from ..kernel.entity import Entity
+from ..components.photon import Photon
 from typing import Optional, Dict, Any
 import numpy as np
 
@@ -18,15 +19,12 @@ class SourcePort(Entity):
     def __init__(self, name, timeline, owner:Node):
         super().__init__(name, timeline)
         self.owner = owner
-        self.port_index = int(name)
         self.add_receiver(owner)
 
     def init(self):
         pass
 
     def get(self, photon, **kwargs):
-        photon.name = self.name
-        photon.port_index = self.port_index
         self._receivers[0].get(photon)
 
 
@@ -48,7 +46,7 @@ class SpdcSourceNode(Node):
             'phase_error': 0.0,
             'bandwidth': 0,
             'encoding': polarization,
-            'bell_state': 'psi+'
+            'bell_state': 'psi-'
         }
 
         # Merge with user config
@@ -64,7 +62,8 @@ class SpdcSourceNode(Node):
             phase_error=float(merged_config['phase_error']),
             bandwidth=float(merged_config['bandwidth']),
             encoding_type=merged_config['encoding'],
-            bell_state=merged_config['bell_state']
+            bell_state=merged_config['bell_state']           
+
         )
 
         # Create and connect output ports
@@ -75,7 +74,6 @@ class SpdcSourceNode(Node):
 
         self.first_component_name = self.spdc.name
         self.spdc.owner = self
-        self.components = [self.spdc] + list(self.ports.values())
 
     def emit(self, num_pulses: int):
         """
@@ -85,14 +83,23 @@ class SpdcSourceNode(Node):
 
 
     def get(self, photon, **kwargs):
-        if hasattr(photon, 'port_index') and photon.port_index == 0:
+        #Count only for signal no need to duplicate for idler
+        if hasattr(photon, 'name') and photon.name == "signal":
             self.emission_count += 1
 
         # Route to appropriate quantum channel based on port name
         try:
-            port_index = getattr(photon, 'port_index', None)
-            if port_index is not None and port_index < len(self.qchannels):
-                self.qchannels[port_index].get(photon)
+            photon_type = getattr(photon, 'name', None)
+            if photon_type == "signal":
+                port_index = 0
+            elif photon_type == "idler":
+                port_index = 1
+            else:
+                raise ValueError(f"Unknown photon type: {photon_type}")
+            for index, dst in enumerate(self.qchannels):
+                if str(port_index) == str(index):
+                    self.send_qubit(dst, photon)
+                    break
         except (AttributeError, IndexError):
             pass
     
@@ -183,11 +190,11 @@ class PolarizationAnalyzerNode(Node):
     
     Supports three architecture modes:
     - 'hwp_only': Photon → HWP → PBS (for linear polarization rotation)
-    - 'qwp_hwp': Photon → QWP → HWP → PBS (for full tomography)
+    - 'hwp_qwp': Photon → HWP → QWP → PBS (for full tomography)
     - 'custom': Manual angle control
     
     Attributes:
-        mode (str): Architecture mode ('hwp_only', 'qwp_hwp', 'custom').
+        mode (str): Architecture mode ('hwp_only', 'hwp_qwp', 'custom').
         qwp (WavePlate | None): Quarter-wave plate (if mode uses it).
         hwp (WavePlate | None): Half-wave plate (if mode uses it).
         detector (QSDetectorPolarizationStatic): Two-output PBS detector.
@@ -205,14 +212,14 @@ class PolarizationAnalyzerNode(Node):
             name (str): node name.
             timeline (Timeline): simulation timeline.
             config (dict): configuration dictionary with optional keys:
-                - 'mode' (str): 'hwp_only', 'qwp_hwp', or 'custom' (default 'qwp_hwp').
+                - 'mode' (str): 'hwp_only', 'hwp_qwp', or 'custom' (default 'hwp_qwp').
                 - 'rotation_angle' (float): For 'hwp_only' mode, rotation angle in radians.
-                - 'basis' (str): For 'qwp_hwp' mode, Pauli basis 'Z', 'X', or 'Y'.
+                - 'basis' (str): For 'hwp_qwp' mode, Pauli basis 'Z', 'X', or 'Y'.
                 - 'qwp_angle' (float): For 'custom' mode, QWP angle in radians.
                 - 'hwp_angle' (float): For 'custom' mode, HWP angle in radians.
                 - 'qwp_fidelity' (float): QWP transmission (default 1.0).
                 - 'hwp_fidelity' (float): HWP transmission (default 1.0).
-                - 'detector_efficiency' (float): SPD efficiency (default 0.9).
+                - 'detector_efficiency' (float): SPD efficiency (default 1.0).
                 - 'dark_count' (float): SPD dark count rate in Hz (default 0).
                 - 'pbs_fidelity' (float): PBS transmission (default 1.0).
                 - 'mismeasure_prob' (float): PBS measurement error (default 0.0).
@@ -221,10 +228,10 @@ class PolarizationAnalyzerNode(Node):
         
         # Parse configuration
         config = config or {}
-        mode = config.get('mode', 'qwp_hwp')
+        mode = config.get('mode', 'hwp_qwp')
         qwp_fidelity = config.get('qwp_fidelity', 1.0)
         hwp_fidelity = config.get('hwp_fidelity', 1.0)
-        detector_efficiency = config.get('detector_efficiency', 0.9)
+        detector_efficiency = config.get('detector_efficiency', 1.0)
         dark_count = config.get('dark_count', 0)
         pbs_fidelity = config.get('pbs_fidelity', 1.0)
         mismeasure_prob = config.get('mismeasure_prob', 0.0)
@@ -243,6 +250,8 @@ class PolarizationAnalyzerNode(Node):
             detector_efficiency=detector_efficiency,
             dark_count=dark_count
         )
+
+        self.add_component(self.detector)
         
         # Build component chain based on mode
         if mode == 'hwp_only':
@@ -256,24 +265,15 @@ class PolarizationAnalyzerNode(Node):
                 angle=rotation_angle / 2.0,  # HWP rotates by 2θ
                 fidelity=hwp_fidelity
             )
-            
+            self.add_component(self.hwp)
             # Wire: HWP → Detector
             self.hwp.add_receiver(self.detector)
             self.hwp.owner = self
             
-            self.components = [self.hwp, self.detector]
             self.set_first_component(self.hwp.name)
-            
-        elif mode == 'qwp_hwp':
-            # QWP + HWP for full tomography
-            self.qwp = WavePlate(
-                f"{name}.QWP",
-                timeline,
-                plate_type="QWP",
-                angle=0.0,
-                fidelity=qwp_fidelity
-            )
-            
+
+        elif mode == 'hwp_qwp':
+            # HWP + QWP for full tomography
             self.hwp = WavePlate(
                 f"{name}.HWP",
                 timeline,
@@ -282,14 +282,22 @@ class PolarizationAnalyzerNode(Node):
                 fidelity=hwp_fidelity
             )
             
-            # Wire: QWP → HWP → Detector
-            self.qwp.add_receiver(self.hwp)
-            self.hwp.add_receiver(self.detector)
+            self.qwp = WavePlate(
+                f"{name}.QWP",
+                timeline,
+                plate_type="QWP",
+                angle=0.0,
+                fidelity=qwp_fidelity
+            )
+            self.add_component(self.qwp)
+            self.add_component(self.hwp)
+            # Wire: HWP → QWP → Detector
+            self.hwp.add_receiver(self.qwp)
+            self.qwp.add_receiver(self.detector)
             self.qwp.owner = self
             self.hwp.owner = self
             
-            self.components = [self.qwp, self.hwp, self.detector]
-            self.set_first_component(self.qwp.name)
+            self.set_first_component(self.hwp.name)
             
             # Set basis if specified
             basis = config.get('basis')
@@ -318,6 +326,7 @@ class PolarizationAnalyzerNode(Node):
                 self.qwp.owner = self
                 first_component = self.qwp
                 last_component = self.qwp
+                self.add_component(self.qwp)
             
             if use_hwp:
                 self.hwp = WavePlate(
@@ -335,6 +344,7 @@ class PolarizationAnalyzerNode(Node):
                     first_component = self.hwp
                     
                 last_component = self.hwp
+                self.add_component(self.hwp)
             
             # Connect to detector
             if last_component:
@@ -342,12 +352,12 @@ class PolarizationAnalyzerNode(Node):
             else:
                 first_component = self.detector
             
-            # Register components
-            self.components = [c for c in [self.qwp, self.hwp, self.detector] if c]
             self.set_first_component(first_component.name)
             
         else:
-            raise ValueError(f"Unknown mode '{mode}'. Use 'hwp_only', 'qwp_hwp', or 'custom'.")
+            raise ValueError(f"Unknown mode '{mode}'. Use 'hwp_only', 'hwp_qwp', or 'custom'.")
+
+        self.classical_noise_count = 0
     
     def init(self) -> None:
         """Initialize all components."""
@@ -357,17 +367,6 @@ class PolarizationAnalyzerNode(Node):
         if self.hwp:
             self.hwp.init()
         self.detector.init()
-    
-    def get(self, photon, **kwargs):
-        """Receive photon and pass to first component.
-        
-        Args:
-            photon (Photon): incoming photon.
-            **kwargs: additional arguments passed through chain.
-        """
-        # Get first component (depends on mode)
-        first = self.components[0]
-        first.get(photon, **kwargs)
     
     # ========================================================================
     # Configuration API
@@ -388,7 +387,7 @@ class PolarizationAnalyzerNode(Node):
         if self.mode != 'hwp_only':
             raise ValueError("set_rotation_angle() only valid in 'hwp_only' mode")
         
-        self.hwp.set_angle(theta_rad / 2.0)
+        self.set_hwp_angle(theta_rad / 2.0)
     
     def set_qwp_angle(self, theta_rad: float) -> None:
         """Set QWP physical angle.
@@ -417,7 +416,7 @@ class PolarizationAnalyzerNode(Node):
         self.hwp.set_angle(theta_rad)
     
     def set_basis(self, basis: str) -> None:
-        """Configure analyzer to measure in a Pauli basis (qwp_hwp mode only).
+        """Configure analyzer to measure in a Pauli basis (hwp_qwp mode only).
         
         Basis configurations:
         - 'Z' (computational): Measures H/V polarization
@@ -433,10 +432,10 @@ class PolarizationAnalyzerNode(Node):
             basis (str): 'Z', 'X', or 'Y'.
             
         Raises:
-            ValueError: if mode is not 'qwp_hwp' or basis invalid.
+            ValueError: if mode is not 'hwp_qwp' or basis invalid.
         """
-        if self.mode != 'qwp_hwp':
-            raise ValueError("set_basis() only valid in 'qwp_hwp' mode")
+        if self.mode != 'hwp_qwp':
+            raise ValueError("set_basis() only valid in 'hwp_qwp' mode")
         
         basis = basis.upper()
         
@@ -500,3 +499,26 @@ class PolarizationAnalyzerNode(Node):
             return 0
         else:
             return 1
+
+    def receive_noise_photon(self) -> None:
+        """Record a Raman noise detection event on a random detector.
+    
+        Raman-scattered noise photons are unpolarized and arrive with random
+        polarization states. Instead of simulating the full photon propagation,
+        this method directly triggers a detection event on a randomly selected
+        detector (0 or 1) with 50% probability each.
+        
+        Physical reasoning:
+        - Raman noise is unpolarized (random polarization)
+        - PBS splits unpolarized light 50/50 between outputs
+        - Direct detector triggering is computationally efficient
+        
+        Called by fiber channel when Raman noise photon arrives.
+        """
+        # Randomly select detector (50/50 probability for unpolarized light)
+        detector_index = 0 if self.get_generator().random() < 0.5 else 1
+        
+        # Record detection at current time
+        self.detector.detectors[detector_index].get()
+
+        self.classical_noise_count += 1

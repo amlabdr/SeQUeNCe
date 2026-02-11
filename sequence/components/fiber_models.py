@@ -14,11 +14,14 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import numpy as np
 
 from ..components.optical_channel import QuantumChannel
-from ..constants import SPEED_OF_LIGHT_M_PER_S
+from ..constants import SPEED_OF_LIGHT_M_PER_S, SPEED_OF_LIGHT, PLANCK_CONSTANT
+
+from sequence.kernel.process import Process
+from sequence.kernel.event import Event
+from ..components.photon import Photon
 
 if TYPE_CHECKING:
     from ..topology.node import Node
-    from ..components.photon import Photon
     from ..kernel.timeline import Timeline
 
 PI = np.pi
@@ -120,6 +123,58 @@ GERMANIA_SELLMEIER = SellmeierModel(
     T_ref_C=24.0,
 )
 
+class RamanScatteringConstants:
+    '''
+    Background-generation constants for Raman scattering.
+
+    From: Burenkov et al., "Synchronization and coexistence in quantum networks,"
+          Optics Express 31, 11431 (2023), Table 2.
+
+    Units: 10^-23 m^-1 Hz^-1
+    '''
+
+    # Beta constants: (beta_FS, beta_BS) for each wavelength pair
+    BETA_TABLE = {
+        # Classical → Quantum : (Forward Scattering, Back Scattering)
+        (1270, 1550): (0.058e-23, 0.061e-23),  # Best option (lowest noise)
+        (1310, 1550): (0.421e-23, 0.449e-23),  # 7x more noise
+        (1330, 1550): (0.699e-23, 0.745e-23),  # 12x more noise
+        (1490, 1550): (3.69e-23,  3.75e-23),   # 64x more noise (avoid!)
+    }
+
+    @staticmethod
+    def get_beta(classical_nm: float, quantum_nm: float) -> tuple[float, float]:
+        '''
+        Get scattering constants for wavelength pair.
+
+        Args:
+            classical_nm: Classical signal wavelength (nm)
+            quantum_nm: Quantum channel wavelength (nm)
+
+        Returns:
+            (beta_FS, beta_BS): Forward and backward scattering constants [m^-1 Hz^-1]
+
+        Raises:
+            ValueError: If wavelength pair not in table
+        '''
+        # Round to nearest 10 nm to match table entries
+        key = (int(round(classical_nm/10)*10), int(round(quantum_nm/10)*10))
+
+        if key not in RamanScatteringConstants.BETA_TABLE:
+            available = list(RamanScatteringConstants.BETA_TABLE.keys())
+            raise ValueError(
+                f"No Raman scattering data for wavelength pair {key}. "
+                f"Available pairs: {available}. "
+                f"Use 1270 nm classical for lowest noise."
+            )
+
+        return RamanScatteringConstants.BETA_TABLE[key]
+
+
+DEFAULT_RAMAN = RamanScatteringConstants()
+
+
+
 
 # -----------------------------
 # Material mixing (Eq. 23 from paper)
@@ -181,6 +236,13 @@ class FiberSpec:
     # DGD numerical derivative step (paper suggests ~0.1 nm)
     d_lambda_m: float = 0.1e-9
 
+    # Classical coexistence (OPTIONAL - default disabled)
+    classical_coexist_enabled: bool = False
+    classical_wavelength_nm: float = 1270.0
+    classical_power_mW: float = 1.0
+    quantum_wavelength_nm: float = wavelength_m * 1e9
+    quantum_bandwidth_Hz: float = 100e9
+
 
 @dataclass
 class FiberSection:
@@ -238,6 +300,33 @@ def jones_circular(delta_beta: float, length_m: float) -> np.ndarray:
     a = 0.5 * delta_beta * length_m
     c, s = np.cos(a), np.sin(a)
     return np.array([[c, -s], [s, c]], dtype=complex)
+
+def get_fiber_attenuation_per_m(wavelength_nm: float) -> float:
+    '''
+    Get fiber attenuation coefficient at any wavelength.
+    
+    Uses SMF-28 measured data from Burenkov et al., Table 1,
+    with linear interpolation for intermediate wavelengths.
+    
+    Args:
+        wavelength_nm: Wavelength in nanometers (valid: 1200-1700 nm)
+        
+    Returns:
+        Attenuation constant alpha in m^-1 (for exponential decay)
+    '''
+    # Measured SMF-28 data points (Table 1)
+    lam_data = np.array([1270, 1310, 1330, 1490, 1550, 1625])
+    alpha_dB_km = np.array([0.34, 0.32, 0.28, 0.19, 0.17, 0.18])
+    
+    # Interpolate to get dB/km at requested wavelength
+    alpha_dB_per_km = float(np.interp(wavelength_nm, lam_data, alpha_dB_km))
+    
+    # Convert dB/km to m^-1:
+    # alpha[m^-1] = alpha[dB/km] × ln(10) / (10 × 1000)
+    alpha_per_m = alpha_dB_per_km * np.log(10) / 10000.0
+    
+    return alpha_per_m
+
 
 
 # -----------------------------
@@ -399,7 +488,7 @@ class fiberQuantumChannel(QuantumChannel):
         attenuation: float,
         distance: float,
         polarization_fidelity: float = 1.0,
-        light_speed: float = SPEED_OF_LIGHT_M_PER_S,
+        light_speed: float = SPEED_OF_LIGHT,
         frequency: float = 8e7,
         spec: Optional[FiberSpec] = None,  # For single uniform fiber
         sections: Optional[list[FiberSection]] = None,  # For multi-section fiber
@@ -435,10 +524,72 @@ class fiberQuantumChannel(QuantumChannel):
         self.tau_dgd_s: float = 0.0
         self.base_group_delay_s: float = 0.0
 
+        # Raman scattering noise parameters
+        self.raman_noise_rate_Hz: float = 0.0
+        self.noise_enabled: bool = False
+        self.raman_const: RamanScatteringConstants = DEFAULT_RAMAN
+
+
+        self.cd_delays_ps = []  # Track all CD delays
+        self.wavelengths_nm = []  # Track all wavelengths
+        self.track_delays = False  # Enable/disable tracking
+
     def init(self) -> None:
         super().init()
         self._compute_link_model()
 
+        if self._is_classical_coexist_enabled():
+            self.raman_noise_rate_FS_Hz, self.raman_noise_rate_BS_Hz = self._compute_raman_noise_rate()
+
+            self.raman_noise_rate_Hz = (
+                self.raman_noise_rate_FS_Hz + self.raman_noise_rate_BS_Hz
+            )
+            self.noise_enabled = True
+            self._schedule_next_noise_photon()
+
+    def enable_delay_tracking(self):
+        """Enable tracking of CD delays for diagnostics."""
+        self.track_delays = True
+        self.cd_delays_ps = []
+        self.wavelengths_nm = []
+    
+    def disable_delay_tracking(self):
+        """Disable tracking to save memory."""
+        self.track_delays = False
+    
+    def get_cd_delay_statistics(self) -> dict:
+        """Get statistics about tracked CD delays."""
+        if not self.cd_delays_ps:
+            return {"count": 0}
+        
+        delays = np.array(self.cd_delays_ps)
+        wavelengths = np.array(self.wavelengths_nm)
+        
+        return {
+            "count": len(delays),
+            "delays_ps": delays,
+            "wavelengths_nm": wavelengths,
+            "mean_delay_ps": np.mean(delays),
+            "std_delay_ps": np.std(delays),
+            "min_delay_ps": np.min(delays),
+            "max_delay_ps": np.max(delays),
+        }
+    
+    def clear_delay_tracking(self):
+        """Clear tracked delays."""
+        self.cd_delays_ps = []
+        self.wavelengths_nm = []
+
+    def set_ends(self, sender: "Node", receiver_name: str) -> None:
+        """
+        Override to start noise photon generation after sender is connected.
+        """
+        super().set_ends(sender, receiver_name)
+        
+        # NOW we can schedule noise photons (sender is connected)
+        if self.noise_enabled and self.raman_noise_rate_Hz > 0:
+            self._schedule_next_noise_photon()
+            
     def _compute_link_model(self) -> None:
         """Compute Jones matrix, DGD, and chromatic dispersion """
 
@@ -544,7 +695,7 @@ class fiberQuantumChannel(QuantumChannel):
         
         return float(total_delay_s)
 
-    def _chromatic_delay_seconds(self, qubit: "Photon") -> float:
+    def _chromatic_delay_picoseconds(self, qubit: "Photon") -> float:
         """
         Chromatic dispersion delay accounting for ALL sections.
         This is already captured in self.DCD_ps_per_nm_km which is the
@@ -552,14 +703,19 @@ class fiberQuantumChannel(QuantumChannel):
         """
         if self.DCD_ps_per_nm_km == 0.0 or not hasattr(qubit, "wavelength"):
             return 0.0
-        
-        dlam_nm = float((qubit.wavelength - self.sections[0].spec.wavelength_m) * 1e9)
+        lambda_q_nm = float(qubit.wavelength)
+        lambda_ref_nm = self.sections[0].spec.wavelength_m * 1e9
+        dlam_nm = lambda_q_nm - lambda_ref_nm
         L_km = self.distance / 1000.0
         
         # This now correctly uses the effective DCD from all sections
         delay_ps = self.DCD_ps_per_nm_km * L_km * dlam_nm
+
+        if self.track_delays:
+            self.cd_delays_ps.append(delay_ps)
+            self.wavelengths_nm.append(lambda_q_nm)
         
-        return float(delay_ps * 1e-12)
+        return delay_ps
     
     def _compute_chromatic_dispersion_numerical(self, spec: FiberSpec) -> float:
         s = spec
@@ -706,22 +862,30 @@ class fiberQuantumChannel(QuantumChannel):
         ):
             self._apply_jones(qubit, self.J_total)
 
-            extra_s = 0.0
-            extra_s += self._sample_pmd_delay_seconds(qubit)
-            extra_s += self._chromatic_delay_seconds(qubit)
+            extra_delay = 0.0
+            pmd_delay = self._sample_pmd_delay_picoseconds(qubit)
+            cd_delay = self._chromatic_delay_picoseconds(qubit)
 
-            from sequence.kernel.process import Process
-            from sequence.kernel.event import Event
+            extra_delay += pmd_delay
+            extra_delay += cd_delay
+            
+            """if hasattr(qubit, 'wavelength') and self.timeline.now() < 1e8:  # Only first ~100 photons
+                print(f"[{self.name}] Photon: λ={qubit.wavelength:.3f} nm, "
+                    f"PMD={pmd_delay*1e12:.1f} ps, "
+                    f"CD={cd_delay*1e12:.1f} ps, "
+                    f"Total extra={extra_s*1e12:.1f} ps")"""
 
-            # Convert seconds to picoseconds for SeQuenCe timeline
-            extra_time = int(round(extra_s * 1e12))
-            future_time = max(self.timeline.now(), self.timeline.now() + self.base_group_delay_s* 1e12 + extra_time)
+            if not extra_delay:
+                print("extra delay is : ", extra_delay)
+            
+            base_ps = int(round(self.base_group_delay_s * 1e12))
+            future_time = self.timeline.now() + base_ps + extra_delay
+            future_time = max(self.timeline.now(), future_time)
 
             process = Process(self.receiver, "receive_qubit", [source.name, qubit])
             self.timeline.schedule(Event(future_time, process))
+            
             return
-
-        super().transmit(qubit, source)
 
     def _apply_jones(self, qubit: "Photon", J: np.ndarray) -> None:
         """Apply Jones matrix to qubit state """
@@ -732,16 +896,16 @@ class fiberQuantumChannel(QuantumChannel):
             return
 
         if state.size == 4:
-            if qubit.name == "0":
+            if qubit.name == "signal":
                 op = np.kron(J, np.eye(2))
-            elif qubit.name == "1":
+            elif qubit.name == "idler":
                 op = np.kron(np.eye(2), J)
             else:
                 return
             qubit.set_state(tuple(op @ state))
     
 
-    def _sample_pmd_delay_seconds(self, qubit: "Photon") -> float:
+    def _sample_pmd_delay_picoseconds(self, qubit: "Photon") -> float:
         """Sample PMD delay: ±tau _DGD/2 based on H-polarization probability """
         if self.tau_dgd_s <= 0.0:
             return 0.0
@@ -760,4 +924,158 @@ class fiberQuantumChannel(QuantumChannel):
             return 0.0
 
         r = self.sender.get_generator().random()
-        return (-0.5 if r < pH else 0.5) * self.tau_dgd_s
+        return (-0.5 if r < pH else 0.5) * self.tau_dgd_s * 1e12
+
+    # =========================================================================
+    # CLASSICAL COEXISTENCE NOISE METHODS
+    # =========================================================================
+
+    def _is_classical_coexist_enabled(self) -> bool:
+        """Check if any section has classical coexistence enabled."""
+        return any(s.spec.classical_coexist_enabled for s in self.sections)
+
+    def _compute_raman_noise_rate(self) -> tuple[float, float]:
+        '''
+        Calculate total Raman scattering noise rate from all sections.
+
+        Based on Burenkov et al., Opt. Express 31, 11431 (2023):
+        - Equation 2: Backward scattering (BS)
+        - Equation 3: Forward scattering (FS)
+
+        Returns:
+            -> tuple[float, float]:
+        '''
+        total_FS = 0.0
+        total_BS = 0.0
+
+        for section in self.sections:
+            s = section.spec
+
+            if not s.classical_coexist_enabled:
+                continue
+
+            # Section length
+            L = section.length_m
+
+            # Convert classical power to photons/s
+            h = PLANCK_CONSTANT
+            c = SPEED_OF_LIGHT_M_PER_S
+            lambda_s = s.classical_wavelength_nm * 1e-9
+
+            E_photon = h * c / lambda_s
+            P_watts = s.classical_power_mW * 1e-3
+            P_in = P_watts / E_photon
+
+            # Get attenuation constants using GLOBAL function (not self.method!)
+            alpha_s = get_fiber_attenuation_per_m(s.classical_wavelength_nm)
+            alpha_n = get_fiber_attenuation_per_m(s.quantum_wavelength_nm)
+
+            # Get scattering constants
+            try:
+                beta_FS, beta_BS = self.raman_const.get_beta(
+                    s.classical_wavelength_nm,
+                    s.quantum_wavelength_nm
+                )
+            except ValueError as e:
+                print(f"Warning: {e}. Skipping noise for section {section}")
+                continue
+
+            # Channel bandwidth
+            Delta_nu = s.quantum_bandwidth_Hz
+
+            # Equation 3: Forward Scattering
+            if abs(alpha_s - alpha_n) > 1e-12:
+                numerator_FS = np.exp(-alpha_n * L) - np.exp(-alpha_s * L)
+                P_FS = (numerator_FS / (alpha_s - alpha_n)) * beta_FS * Delta_nu * P_in
+            else:
+                P_FS = L * np.exp(-alpha_n * L) * beta_FS * Delta_nu * P_in
+
+            # Equation 2: Backward Scattering
+            numerator_BS = 1.0 - np.exp(-(alpha_s + alpha_n) * L)
+            P_BS = (numerator_BS / (alpha_s + alpha_n)) * beta_BS * Delta_nu * P_in
+
+            total_FS += P_FS
+            total_BS += P_BS
+
+        return float(total_FS), float(total_BS)
+
+
+    def _schedule_next_noise_photon(self) -> None:
+        """
+        Schedule the next Raman noise photon arrival.
+
+        Uses Poisson process: inter-arrival times follow exponential distribution.
+        Creates an actual noise photon and transmits it through the channel.
+        """
+        if not self.noise_enabled or self.raman_noise_rate_Hz <= 0:
+            return
+
+        # Sample inter-arrival time from exponential distribution
+        rate = self.raman_noise_rate_Hz  # [photons/s]
+        u = self.sender.get_generator().random()
+        wait_time_s = -np.log(max(u, 1e-10)) / rate
+        wait_time_ps = int(round(wait_time_s * 1e12))
+
+        # Schedule creation and transmission of noise photon
+        generation_time = self.timeline.now() + wait_time_ps
+
+        # Create process to generate and send noise photon
+        process = Process(self, "_generate_and_transmit_noise_photon", [])
+        event = Event(generation_time, process)
+        self.timeline.schedule(event)
+
+    def _generate_and_transmit_noise_photon(self) -> None:
+        """
+        Generate and record a Raman noise photon detection.
+        
+        Instead of creating and transmitting a full photon object, this method
+        directly triggers a detection event at the receiver. This is computationally
+        efficient and physically accurate for unpolarized Raman noise.
+        
+        Physical model:
+        - Raman scattering produces unpolarized light
+        - Unpolarized photons have 50/50 probability at PBS
+        - Photons still experience fiber loss (accounted for in noise rate calculation)
+        """
+        
+        # Schedule noise detection at receiver
+        arrival_time = self.timeline.now()
+        
+        # Call receiver's noise handling method
+        process = Process(self.receiver, "receive_noise_photon", [])
+        self.timeline.schedule(Event(arrival_time, process))
+        
+        # Schedule next noise photon (maintain Poisson process)
+        self._schedule_next_noise_photon()
+        
+
+    def get_noise_info(self) -> dict:
+        """
+        Get diagnostic information about Raman noise configuration.
+
+        Returns:
+            Dictionary with noise parameters and expected rates
+        """
+        if not self.noise_enabled:
+            return {"enabled": False}
+
+        # Collect info from first enabled section (for display)
+        enabled_sections = [s for s in self.sections if s.spec.classical_coexist_enabled]
+
+        if not enabled_sections:
+            return {"enabled": False}
+
+        s = enabled_sections[0].spec
+
+        return {
+            "enabled": True,
+            "total_noise_rate_Hz": self.raman_noise_rate_Hz,
+            "total_noise_rate_per_sec": self.raman_noise_rate_Hz,
+            "classical_wavelength_nm": s.classical_wavelength_nm,
+            "classical_power_mW": s.classical_power_mW,
+            "quantum_wavelength_nm": s.quantum_wavelength_nm,
+            "quantum_bandwidth_GHz": s.quantum_bandwidth_Hz / 1e9,
+            "fiber_length_km": self.distance / 1000.0,
+            "expected_accidentals_per_ms": self.raman_noise_rate_Hz / 1000.0,
+        }
+

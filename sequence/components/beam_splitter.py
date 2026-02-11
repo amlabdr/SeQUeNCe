@@ -242,7 +242,7 @@ class PolarizingBeamSplitter(Entity):
             # Measure in fixed basis
             basis = polarization["bases"][self.basis_index]
             result = Photon.measure(basis, photon, self.get_generator())
-            
+
             # Apply measurement error (bit flip)
             if self.get_generator().random() < self.mismeasure_prob:
                 result = 1 - result

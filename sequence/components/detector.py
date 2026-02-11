@@ -724,7 +724,7 @@ class QSDetectorPolarizationStatic(QSDetector):
     def __init__(self, name: str, timeline: "Timeline", basis_index: int = 0,
                  PBS_fidelity: float = 1.0, mismeasure_prob: float = 0.0,
                  detector_efficiency: float = 0.9, dark_count: float = 0,
-                 count_rate: float = 25e6, time_resolution: int = 150):
+                 count_rate: float = 25e6, time_resolution: int = 1):
         """Constructor for static-basis polarization detector.
         
         Args:

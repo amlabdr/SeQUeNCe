@@ -85,8 +85,6 @@ class WavePlate(Entity):
         
         Args:
             photon (Photon): photon to transform (must have polarization encoding).
-            **kwargs: additional arguments. For entangled states, use 'which_qubit'=0 or 1
-                     to specify which qubit to transform.
             
         Side Effects:
             May discard photon if fidelity check fails.
@@ -113,16 +111,13 @@ class WavePlate(Entity):
             photon.set_state(new_state_tuple)
             
         elif len(full_state) == 4:
-            # Entangled two-photon state (4D)
-            # Use which_qubit to determine which photon to act on
-            which_qubit = kwargs.get('which_qubit', 0)
-            
-            if which_qubit == 0:
+            # Entangled two-photon state (4D)            
+            if photon.name == "signal":
                 op = self.unitary_signal  # Act on first qubit (signal)
-            elif which_qubit == 1:
+            elif photon.name == "idler":
                 op = self.unitary_idler   # Act on second qubit (idler)
             else:
-                raise ValueError(f"which_qubit must be 0 or 1, got {which_qubit}")
+                raise ValueError(f"Photon name must be 'signal' or 'idler', got {photon.name}")
             
             new_state = dot(op, full_state)
             photon.set_state(tuple(new_state))

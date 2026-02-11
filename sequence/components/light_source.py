@@ -107,17 +107,11 @@ class SPDCBellSource(LightSource):
     entangled photon pairs at a specified frequency. Each photon pair is emitted
     in one of the four maximally-entangled Bell states (|Φ±⟩, |Ψ±⟩).
 
-    The source implements realistic SPDC physics:
-    - Energy-conserving wavelength correlation (lambda_signal * lambda_idler = lambda_pump²)
-    - Gaussian wavelength distribution around central value
-    - Configurable photon statistics (thermal or Poisson)
-
     Attributes:
         bell_state_label (str): Label of the Bell state ("phi+", "phi-", "psi+", "psi-").
         bell_state (tuple): 4D state vector of the selected Bell state in
             computational basis |HH⟩, |HV⟩, |VH⟩, |VV⟩.
-        wavelengths (list[float]): Two-element list [lambda_min, lambda_max] defining
-            wavelength range in nm for energy-conserving sampling.
+        wavelengths (list[float], optional): Two-element list [lambda_signal, lambda_idler] 
         photon_statistics (str): Distribution type ("thermal" or "poisson").
     """
 
@@ -129,15 +123,14 @@ class SPDCBellSource(LightSource):
     }
 
     def __init__(self, name, timeline, wavelengths=None, frequency=8e7, mean_photon_num=0.1,
-                 encoding_type=polarization, phase_error=0, bandwidth=0, photon_statistics="thermal", bell_state="psi+"):
+                 encoding_type=polarization, phase_error=0, bandwidth=0, photon_statistics="thermal", bell_state="psi-"):
         """
         Constructor for SPDCBellSource.
 
         Args:
             name (str): Name of the source instance.
             timeline (Timeline): Simulation timeline.
-            wavelengths (list[float], optional): Two-element list [lambda_min, lambda_max] 
-                defining wavelength sampling range in nm. If None, defaults to [1550, 1550].
+            wavelengths (list[float], optional): Two-element list [lambda_signal, lambda_idler] 
             frequency (float): Pulse repetition frequency in Hz (default 80 MHz).
             mean_photon_num (float): Mean number of photon pairs per pulse (default 0.1).
             encoding_type (dict): Photon encoding scheme (default polarization encoding).
@@ -159,6 +152,7 @@ class SPDCBellSource(LightSource):
             self.set_wavelength()
         self.bell_state_label = bell_state
         self.bell_state = self.bell_state_map[bell_state]
+        self.bandwidth = bandwidth
 
     def init(self):
         assert len(self._receivers) == 2, "SPDCBellSource source must connect to 2 receivers."
@@ -195,8 +189,10 @@ class SPDCBellSource(LightSource):
         configured distribution (thermal or Poisson). Photons are sent to 
         the two connected receivers with appropriate time delays.
 
-        Wavelength correlation: For each pair, signal and idler wavelengths
-        are sampled to satisfy energy conservation (lambda_signal * lambda_idler = lambda_pump^2).
+        Wavelength correlation: Signal wavelength is sampled from a Gaussian
+        distribution centered at lambda_signal_center with standard deviation
+        = bandwidth/3. Idler wavelength is computed using EXACT energy conservation:
+        1/lambda_pump = 1/lambda_signal + 1/lambda_idler
 
         Timing: Pulses are spaced by 1/frequency. Photon pairs within a pulse
         are sent at the same time.
@@ -212,20 +208,32 @@ class SPDCBellSource(LightSource):
         time = self.timeline.now()
         period = int(round(1e12 / self.frequency))
 
-        lam_min, lam_max = self.wavelengths
-        lam0 = 0.5 * (lam_min + lam_max)
-        delta_max = 0.5 * (lam_max - lam_min)
-        sigma = delta_max / 3
+        # Unpack center wavelengths for signal and idler channels
+        lambda_signal_center = self.wavelengths[0]
+        lambda_idler_center = self.wavelengths[1]
+        
+        lam_avg = 0.5 * (lambda_signal_center + lambda_idler_center)
+        lambda_pump = lam_avg / 2.0
+
+        sigma = self.bandwidth / 3.0 if self.bandwidth > 0 else 0.0
 
         for _ in range(num_pulses):
             num_pairs = self.sample_photon_pairs()
             for _ in range(num_pairs):
                 delta = sigma * self.get_generator().standard_normal()
-                delta = np.clip(delta, -delta_max, delta_max)
+                while abs(delta) > 3 * sigma:
+                    delta = sigma * self.get_generator().standard_normal()
 
-                lambda_signal = lam0 + delta
-                lambda_idler  = lam0 * lam0 / lambda_signal
-
+                lambda_signal = lambda_signal_center  + delta
+                inv_pump = 1.0 / lambda_pump
+                inv_signal = 1.0 / lambda_signal
+                inv_idler = inv_pump - inv_signal
+                if inv_idler <= 0:
+                    # This shouldn't happen with reasonable bandwidth, but safety check
+                    print(f"Warning: Invalid idler wavelength at signal={lambda_signal:.3f} nm. Skipping pair.")
+                    continue
+                lambda_idler = 1.0 / inv_idler
+                
                 new_photon0 = Photon("signal", self.timeline,
                                      wavelength=lambda_signal,
                                      location=self,

@@ -6,6 +6,9 @@ from typing import Final
 SPEED_OF_LIGHT: Final = 2e-4
 SPEED_OF_LIGHT_M_PER_S = 299792458.0  # m/s (SI units)
 
+# Planck constant
+PLANCK_CONSTANT: Final = 6.62607015e-34  # J·s (SI units)
+
 # |0> and |1>
 KET0: Final = (1, 0)
 KET1: Final = (0, 1)

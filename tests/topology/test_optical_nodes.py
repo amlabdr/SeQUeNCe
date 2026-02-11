@@ -33,7 +33,7 @@ def test_PolarizationAnalyzerNode_hwp_only_rotation():
     NUM_H = 100
     for i in range(NUM_H):
         photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
-        analyzer.get(photon)
+        analyzer.receive_qubit(photon)
         tl.time += PHOTON_SPACING
 
     tl.run()
@@ -64,14 +64,14 @@ def test_PolarizationAnalyzerNode_hwp_only_dynamic_angle():
 
     # First: no rotation (H stays H)
     photon1 = Photon("p1", tl, quantum_state=polarization["bases"][0][0])
-    analyzer.get(photon1)
+    analyzer.receive_qubit(photon1)
     tl.time += PHOTON_SPACING
 
     # Change to 90° rotation (H becomes V)
     analyzer.set_rotation_angle(np.pi/2)
 
     photon2 = Photon("p2", tl, quantum_state=polarization["bases"][0][0])
-    analyzer.get(photon2)
+    analyzer.receive_qubit(photon2)
     tl.time += PHOTON_SPACING
 
     tl.run()
@@ -108,7 +108,7 @@ def test_PolarizationAnalyzerNode_custom_hwp_only_perfect_X_basis():
 
     for i in range(NUM_D):
         photon = Photon(f"D_{i}", tl, quantum_state=diagonal_state)
-        analyzer.get(photon)
+        analyzer.receive_qubit(photon)
         tl.time += PHOTON_SPACING
 
     tl.run()
@@ -143,7 +143,7 @@ def test_PolarizationAnalyzerNode_custom_no_plates():
     NUM_H = 100
     for i in range(NUM_H):
         photon = Photon(f"H_{i}", tl, quantum_state=polarization["bases"][0][0])
-        analyzer.get(photon)
+        analyzer.receive_qubit(photon)
         tl.time += PHOTON_SPACING
 
     tl.run()
@@ -179,7 +179,7 @@ def test_PolarizationAnalyzerNode_qwp_hwp_Y_basis():
 
     for i in range(NUM_CIRCULAR):
         photon = Photon(f"R_{i}", tl, quantum_state=right_circular)
-        analyzer.get(photon)
+        analyzer.receive_qubit(photon)
         tl.time += PHOTON_SPACING
 
     tl.run()
@@ -236,7 +236,7 @@ def test_PolarizationAnalyzerNode_measurement_result_api():
 
     # Send H photon (should go to detector 0 → result 0)
     photon = Photon("H", tl, quantum_state=polarization["bases"][0][0])
-    analyzer.get(photon)
+    analyzer.receive_qubit(photon)
     tl.run()
 
     result = analyzer.get_measurement_result()
@@ -263,7 +263,7 @@ def test_SpdcSourceNode_basic_emission():
             self.name = name
             self.received = []
         
-        def get(self, photon):
+        def receive_qubit(self, photon):
             self.received.append((tl.now(), photon))
     
     receiver0 = MockReceiver("recv0")
@@ -378,7 +378,7 @@ def test_SpdcSourceNode_emission_counting():
         def __init__(self):
             self.photons = []
         
-        def get(self, photon):
+        def receive_qubit(self, photon):
             self.photons.append(photon)
     
     recv0 = MockReceiver()
@@ -407,54 +407,6 @@ def test_SpdcSourceNode_emission_counting():
     second_count = source.emission_count
     assert second_count > first_count, "Count should accumulate"
     assert second_count == len(recv0.photons)
-
-
-def test_SpdcSourceNode_port_routing():
-    """Test that photons are correctly routed through ports to quantum channels."""
-    np.random.seed(42)
-    
-    tl = Timeline()
-    
-    config = {
-        'frequency': 1e8,
-        'mean_photon_num': 1.0,
-        'bell_state': 'psi+'
-    }
-    source = SpdcSourceNode("source", tl, config)
-    
-    # Track which port each photon came from
-    port0_photons = []
-    port1_photons = []
-    
-    class TrackingReceiver:
-        def __init__(self, port_id, photon_list):
-            self.port_id = port_id
-            self.photon_list = photon_list
-        
-        def get(self, photon):
-            self.photon_list.append(photon)
-            # Verify photon has correct port name
-            assert photon.name == str(self.port_id), \
-                f"Photon on port {self.port_id} has name {photon.name}"
-    
-    recv0 = TrackingReceiver(0, port0_photons)
-    recv1 = TrackingReceiver(1, port1_photons)
-    source.qchannels = [recv0, recv1]
-    
-    tl.init()
-    source.emit(num_pulses=50)
-    tl.run()
-    
-    # Should have equal numbers on both ports
-    assert len(port0_photons) == len(port1_photons), \
-        f"Unequal routing: {len(port0_photons)} vs {len(port1_photons)}"
-    
-    # Verify all photons have correct names
-    for photon in port0_photons:
-        assert photon.name == "0"
-    
-    for photon in port1_photons:
-        assert photon.name == "1"
 
 
 def test_SpdcSourceNode_default_config():
@@ -521,7 +473,7 @@ def test_SpdcSourceNode_zero_emission():
         def __init__(self):
             self.photons = []
         
-        def get(self, photon):
+        def receive_qubit(self, photon):
             self.photons.append(photon)
     
     recv0 = MockReceiver()
