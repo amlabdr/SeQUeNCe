@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from sequence.components.fiber_models import fiberQuantumChannel, FiberSpec, FiberSection
+from sequence.components.fiber_quantum_channel import fiberQuantumChannel, FiberSpec, FiberSection
 from sequence.components.photon import Photon
 from sequence.kernel.timeline import Timeline
 from sequence.topology.node import Node
@@ -61,7 +61,7 @@ def test_FiberSpec_custom_parameters():
 
 def test_Sellmeier_silica_at_1550nm():
     """Test silica refractive index at 1550 nm matches BIFROST exactly."""
-    from sequence.components.fiber_models import SILICA_SELLMEIER
+    from sequence.components.fiber_quantum_channel import SILICA_SELLMEIER
     
     n_silica = SILICA_SELLMEIER.n(1550e-9, temperature_C=20.0)
     
@@ -71,7 +71,7 @@ def test_Sellmeier_silica_at_1550nm():
 
 def test_Sellmeier_germania_at_1550nm():
     """Test germania refractive index at 1550 nm matches BIFROST."""
-    from sequence.components.fiber_models import GERMANIA_SELLMEIER
+    from sequence.components.fiber_quantum_channel import GERMANIA_SELLMEIER
     
     n_germania = GERMANIA_SELLMEIER.n(1550e-9, temperature_C=24.0)
     
@@ -81,7 +81,7 @@ def test_Sellmeier_germania_at_1550nm():
 
 def test_GlassMixture_pure_silica():
     """Test glass mixture with m=0 gives pure silica."""
-    from sequence.components.fiber_models import GlassMixture, SILICA_SELLMEIER
+    from sequence.components.fiber_quantum_channel import GlassMixture, SILICA_SELLMEIER
     
     mixture = GlassMixture(m_germania=0.0)
     n_mix = mixture.n(1550e-9, 20.0)
@@ -92,7 +92,7 @@ def test_GlassMixture_pure_silica():
 
 def test_GlassMixture_doped_core():
     """Test doped glass has intermediate refractive index."""
-    from sequence.components.fiber_models import GlassMixture
+    from sequence.components.fiber_quantum_channel import GlassMixture
     
     core = GlassMixture(m_germania=0.036)  # 3.6% germania
     clad = GlassMixture(m_germania=0.0)    # Pure silica
@@ -111,7 +111,7 @@ def test_GlassMixture_doped_core():
 
 def test_Sellmeier_temperature_dependence():
     """Test refractive index changes with temperature (BIFROST has strong T-dependence)."""
-    from sequence.components.fiber_models import SILICA_SELLMEIER
+    from sequence.components.fiber_quantum_channel import SILICA_SELLMEIER
     
     n_20C = SILICA_SELLMEIER.n(1550e-9, temperature_C=20.0)
     n_80C = SILICA_SELLMEIER.n(1550e-9, temperature_C=80.0)
@@ -130,7 +130,7 @@ def test_Sellmeier_temperature_dependence():
 
 def test_v_parameter_SMF28():
     """Test V-parameter for SMF-28 at 1550 nm."""
-    from sequence.components.fiber_models import v_parameter, GlassMixture
+    from sequence.components.fiber_quantum_channel import v_parameter, GlassMixture
     
     spec = FiberSpec()
     nco = GlassMixture(spec.core_m_germania).n(spec.wavelength_m, spec.temperature_C)
@@ -144,7 +144,7 @@ def test_v_parameter_SMF28():
 
 def test_beta_fundamental():
     """Test propagation constant has reasonable value."""
-    from sequence.components.fiber_models import beta_fundamental_approx, GlassMixture
+    from sequence.components.fiber_quantum_channel import beta_fundamental_approx, GlassMixture
     
     spec = FiberSpec()
     nco = GlassMixture(spec.core_m_germania).n(spec.wavelength_m, spec.temperature_C)
@@ -162,7 +162,7 @@ def test_beta_fundamental():
 
 def test_birefringence_circular_core_zero():
     """Test circular core (epsilon=1.0) gives zero ellipticity birefringence."""
-    from sequence.components.fiber_models import delta_beta_core_ellipticity, GlassMixture
+    from sequence.components.fiber_quantum_channel import delta_beta_core_ellipticity, GlassMixture
     
     spec = FiberSpec(core_ellipticity=1.0)  # Perfectly circular
     nco = GlassMixture(spec.core_m_germania).n(spec.wavelength_m, spec.temperature_C)
@@ -175,7 +175,7 @@ def test_birefringence_circular_core_zero():
 
 def test_birefringence_elliptical_core_nonzero():
     """Test elliptical core gives nonzero birefringence."""
-    from sequence.components.fiber_models import delta_beta_core_ellipticity, GlassMixture
+    from sequence.components.fiber_quantum_channel import delta_beta_core_ellipticity, GlassMixture
     
     spec = FiberSpec(core_ellipticity=1.005)  # 0.5% ellipticity
     nco = GlassMixture(spec.core_m_germania).n(spec.wavelength_m, spec.temperature_C)
@@ -192,7 +192,7 @@ def test_birefringence_thermal_stress_depends_on_ellipticity():
     Test thermal stress birefringence depends on ellipticity and temperature.
     Note: Thermal stress uses (T_softening - T_actual), not reference temperature!
     """
-    from sequence.components.fiber_models import delta_beta_asym_thermal, GlassMixture, DEFAULT_CONST
+    from sequence.components.fiber_quantum_channel import delta_beta_asym_thermal, GlassMixture, DEFAULT_CONST
     
     # Test 1: Circular core should give zero thermal stress
     spec_circular = FiberSpec(
@@ -216,7 +216,7 @@ def test_birefringence_thermal_stress_depends_on_ellipticity():
 
 def test_birefringence_straight_fiber_zero():
     """Test straight fiber (R=0) gives zero bending birefringence."""
-    from sequence.components.fiber_models import delta_beta_bending, GlassMixture, DEFAULT_CONST
+    from sequence.components.fiber_quantum_channel import delta_beta_bending, GlassMixture, DEFAULT_CONST
     
     spec = FiberSpec(bend_radius_m=0.0)
     nco = GlassMixture(spec.core_m_germania).n(spec.wavelength_m, spec.temperature_C)
@@ -228,7 +228,7 @@ def test_birefringence_straight_fiber_zero():
 
 def test_birefringence_no_twist_zero():
     """Test no twist gives zero circular birefringence."""
-    from sequence.components.fiber_models import delta_beta_twist, GlassMixture, DEFAULT_CONST
+    from sequence.components.fiber_quantum_channel import delta_beta_twist, GlassMixture, DEFAULT_CONST
     
     spec = FiberSpec(twist_rate_rad_per_m=0.0)
     nco = GlassMixture(spec.core_m_germania).n(spec.wavelength_m, spec.temperature_C)
@@ -1015,7 +1015,7 @@ def test_multi_section_lengths_sum_validation():
 # ============================================================================
 
 import numpy as np
-from sequence.components.fiber_models import get_fiber_attenuation_per_m
+from sequence.components.fiber_quantum_channel import get_fiber_attenuation_per_m
 
 def calculate_launching_power_mW(
     output_power_W: float,
@@ -1062,7 +1062,7 @@ def test_raman_scattering_constants_table2():
     
     Beta constants in units of 10^-23 m^-1 Hz^-1 for 100 GHz DWDM channel.
     """
-    from sequence.components.fiber_models import RamanScatteringConstants
+    from sequence.components.fiber_quantum_channel import RamanScatteringConstants
     
     raman = RamanScatteringConstants()
     
@@ -1523,6 +1523,15 @@ def test_raman_noise_photon_generation():
             else:
                 self.signal_photon_count += 1
         
+        def receive_noise_photon(self):
+            # Called by fiberQuantumChannel._generate_and_transmit_noise_photon()
+            self.noise_photon_count += 1
+            self.received_photons.append({
+                'time': self.timeline.now(),
+                'name': 'raman_noise',
+                'is_noise': True
+            })
+
         def get_generator(self):
             return self.generator
     

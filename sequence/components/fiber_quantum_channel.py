@@ -1007,9 +1007,12 @@ class fiberQuantumChannel(QuantumChannel):
         Uses Poisson process: inter-arrival times follow exponential distribution.
         Creates an actual noise photon and transmits it through the channel.
         """
-        if not self.noise_enabled or self.raman_noise_rate_Hz <= 0:
+        if (
+            not self.noise_enabled
+            or self.raman_noise_rate_Hz <= 0
+            or self.sender is None 
+        ):
             return
-
         # Sample inter-arrival time from exponential distribution
         rate = self.raman_noise_rate_Hz  # [photons/s]
         u = self.sender.get_generator().random()
