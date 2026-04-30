@@ -37,6 +37,7 @@ dependencies = [
     "qutip>=5.2.2",
     "qutip-qip>=0.4.1",
     "scipy>=1.16.3",
+    "seaborn>=0.13.2",
     "tqdm>=4.67.1",
 ]
 

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..topology.node import Node
 
 from numpy import trace
+import numpy as np
 
 from .photon import Photon
 from ..kernel.quantum_utils import povm_0
@@ -85,6 +86,122 @@ class BeamSplitter(Entity):
         self.basis_list = basis_list
         self.start_time = start_time
         self.frequency = frequency
+
+
+class HOMBeamSplitter(Entity):
+    """50:50 beam splitter model for Hong-Ou-Mandel interference.
+
+    This component provides event-level sampling for one-photon-per-input HOM events.
+    It does not require both photons to have a shared source pulse id. Instead, users
+    should provide arrival times from network events and pair photons externally.
+
+    The model uses:
+    - relative delay between two input arms,
+    - temporal wavepacket width derived from source bandwidth,
+    - mode overlap / distinguishability factor.
+
+    For one photon in each input arm:
+    - distinguishable limit -> coincidence probability 0.5,
+    - ideal indistinguishable at zero delay -> full bunching, zero coincidence.
+    """
+
+    def __init__(self, name: str, timeline):
+        Entity.__init__(self, name, timeline)
+
+    def init(self) -> None:
+        pass
+
+    @staticmethod
+    def temporal_overlap(delta_t_ps: float, lambda_nm: float, bandwidth_nm: float) -> float:
+        """Gaussian temporal mode overlap in [0, 1].
+
+        Temporal width is derived from source spectral width:
+        """
+        c_nm_per_ps = 299792.458
+        if bandwidth_nm is None or bandwidth_nm <= 0:
+            # Monochromatic limit -> very long coherence time.
+            return 1.0
+        if lambda_nm is None or lambda_nm <= 0:
+            return 0.0
+        temporal_width_ps = (lambda_nm ** 2) / (c_nm_per_ps * bandwidth_nm)
+        if temporal_width_ps <= 0:
+            return 0.0
+        return float(np.exp(-(delta_t_ps / temporal_width_ps) ** 2))
+
+    def two_photon_outcome(
+        self,
+        arrival_arm0_ps: int,
+        arrival_arm1_ps: int,
+        scan_delay_ps: int = 0,
+        lambda_nm: float = 1550.0,
+        bandwidth_nm: float = 0.0,
+        mode_overlap: float = 1.0,
+        extra_overlap_scale: float = 1.0,
+        spectral_overlap: float = 1.0,
+        polarization_overlap: float = 1.0,
+    ) -> dict:
+        """Sample one HOM event with one photon in each input arm.
+
+        Args:
+            arrival_arm0_ps (int): photon arrival time at input arm 0 (ps).
+            arrival_arm1_ps (int): photon arrival time at input arm 1 before scan delay (ps).
+            scan_delay_ps (int): additional delay on arm 1 in ps.
+            lambda_nm (float): central wavelength used for temporal-width conversion.
+            bandwidth_nm (float): effective source bandwidth in nm.
+            mode_overlap (float): fixed overlap factor in [0, 1].
+            extra_overlap_scale (float): optional extra overlap reduction in [0, 1].
+            spectral_overlap (float): wavelength-overlap factor in [0, 1].
+            polarization_overlap (float): polarization-overlap factor in [0, 1].
+
+        Returns:
+            dict: event fields including sampled output mode occupations.
+                `outputs` is one of [0,0], [1,1], [0,1].
+        """
+        eff_t1 = int(arrival_arm1_ps + scan_delay_ps)
+        delta_t_ps = float(arrival_arm0_ps - eff_t1)
+        overlap_t = self.temporal_overlap(delta_t_ps, lambda_nm, bandwidth_nm)
+        total_scale = (
+            float(np.clip(mode_overlap, 0.0, 1.0))
+            * float(np.clip(extra_overlap_scale, 0.0, 1.0))
+            * float(np.clip(spectral_overlap, 0.0, 1.0))
+            * float(np.clip(polarization_overlap, 0.0, 1.0))
+        )
+        overlap = overlap_t * total_scale
+        overlap = float(np.clip(overlap, 0.0, 1.0))
+
+        # For a symmetric 50:50 BS with partial indistinguishability.
+        p_coinc = 0.5 * (1.0 - overlap)
+        p_bunch = 1.0 - p_coinc
+        p_out0 = 0.5 * p_bunch
+        p_out1 = 0.5 * p_bunch
+
+        draw = self.get_generator().random()
+        if draw < p_out0:
+            outputs = [0, 0]
+        elif draw < (p_out0 + p_out1):
+            outputs = [1, 1]
+        else:
+            outputs = [0, 1]
+
+        return {
+            "arrival_arm0_ps": int(arrival_arm0_ps),
+            "arrival_arm1_ps": int(arrival_arm1_ps),
+            "effective_arrival_arm1_ps": eff_t1,
+            "delta_t_ps": delta_t_ps,
+            "temporal_overlap": overlap_t,
+            "spectral_overlap": float(np.clip(spectral_overlap, 0.0, 1.0)),
+            "polarization_overlap": float(np.clip(polarization_overlap, 0.0, 1.0)),
+            "extra_overlap_scale": float(np.clip(extra_overlap_scale, 0.0, 1.0)),
+            "mode_overlap": float(np.clip(mode_overlap, 0.0, 1.0)),
+            "total_overlap": overlap,
+            "p_coincidence": p_coinc,
+            "p_bunching": p_bunch,
+            "outputs": outputs,
+        }
+
+    def single_photon_output(self) -> int:
+        """Sample output detector (0/1) for a single photon input event."""
+        return int(self.get_generator().choice([0, 1]))
 
 
 class FockBeamSplitter(Entity):
