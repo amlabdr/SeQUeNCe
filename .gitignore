@@ -149,6 +149,19 @@ utils/json_config_generators/*.json
 
 .virtual_documents/
 
-# HOM validation generated outputs
-example/hom_swapping_validation/results/
+# HOM validation generated outputs.
+# Keep generated logs, Slurm scripts, shards, and ad-hoc configs ignored, but
+# allow checked-in reference CSVs used by the validation notebooks.
+example/hom_swapping_validation/results/*
+!example/hom_swapping_validation/results/hom_config/
+!example/hom_swapping_validation/results/hom_config/*.csv
+!example/hom_swapping_validation/results/hom_bsm_only_config/
+!example/hom_swapping_validation/results/hom_bsm_only_config/*.csv
+!example/hom_swapping_validation/results/hom_three_overlap_batch_config/
+!example/hom_swapping_validation/results/hom_three_overlap_batch_config/*.csv
 
+# Keep runtime logs/scripts out of the reference-result commit.
+example/hom_swapping_validation/results/**/*.out
+example/hom_swapping_validation/results/**/*.err
+example/hom_swapping_validation/results/**/*.slurm
+example/hom_swapping_validation/results/**/shards/
