@@ -520,6 +520,8 @@ class fiberQuantumChannel(QuantumChannel):
         self.const = const
 
         self.J_total: Optional[np.ndarray] = None
+        self.J_total_signal: Optional[np.ndarray] = None
+        self.J_total_idler: Optional[np.ndarray] = None
         self.DCD_ps_per_nm_km: float = 0.0
         self.tau_dgd_s: float = 0.0
         self.base_group_delay_s: float = 0.0
@@ -623,6 +625,8 @@ class fiberQuantumChannel(QuantumChannel):
             J_composite = J_section @ J_composite
         
         self.J_total = J_composite
+        self.J_total_signal = np.kron(self.J_total, np.eye(2, dtype=complex))
+        self.J_total_idler = np.kron(np.eye(2, dtype=complex), self.J_total)
         
         self.DCD_ps_per_nm_km = self._compute_total_chromatic_dispersion()
         self.tau_dgd_s = self._compute_dgd_seconds()
@@ -897,9 +901,9 @@ class fiberQuantumChannel(QuantumChannel):
 
         if state.size == 4:
             if qubit.name == "signal":
-                op = np.kron(J, np.eye(2))
+                op = self.J_total_signal if J is self.J_total else np.kron(J, np.eye(2, dtype=complex))
             elif qubit.name == "idler":
-                op = np.kron(np.eye(2), J)
+                op = self.J_total_idler if J is self.J_total else np.kron(np.eye(2, dtype=complex), J)
             else:
                 return
             qubit.set_state(tuple(op @ state))

@@ -766,6 +766,8 @@ class QSDetectorPolarizationStatic(QSDetector):
         self.splitter.add_receiver(self.detectors[1])
         
         self.trigger_times = [[], []]
+        self.detection_records = [[], []]
+        self._pending_photon = None
         self.components = [self.splitter] + self.detectors
 
     def init(self) -> None:
@@ -784,7 +786,21 @@ class QSDetectorPolarizationStatic(QSDetector):
         Side Effects:
             Will call get method of attached beam splitter.
         """
+        self._pending_photon = photon
         self.splitter.get(photon)
+        self._pending_photon = None
+
+    def trigger(self, detector: Detector, info: dict[str, Any]) -> None:
+        detector_index = self.detectors.index(detector)
+        self.trigger_times[detector_index].append(info['time'])
+        photon = self._pending_photon
+        if photon is not None:
+            self.detection_records[detector_index].append({
+                "time": info["time"],
+                "pair_id": getattr(photon, "pair_id", None),
+                "pair_source": getattr(photon, "pair_source", None),
+                "result": int(getattr(photon, "pbs_measurement_result", detector_index)),
+            })
 
     def get_photon_times(self) -> list[list[int]]:
         """Get detection times and reset internal buffer.
@@ -798,6 +814,12 @@ class QSDetectorPolarizationStatic(QSDetector):
         times = self.trigger_times
         self.trigger_times = [[], []]
         return times
+
+    def get_detection_records(self) -> list[list[dict]]:
+        """Get detector-channel records and reset the record buffer."""
+        records = self.detection_records
+        self.detection_records = [[], []]
+        return records
 
     def set_basis_list(self, basis_list: list[int], start_time: int, frequency: float) -> None:
         """Dummy method for interface compatibility.

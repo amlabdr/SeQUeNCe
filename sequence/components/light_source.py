@@ -119,11 +119,12 @@ class SPDCBellSource(LightSource):
         "phi+": (1 / sqrt(2), 0, 0, 1 / sqrt(2)),
         "phi-": (1 / sqrt(2), 0, 0, -1 / sqrt(2)),
         "psi+": (0, 1 / sqrt(2), 1 / sqrt(2), 0),
-        "psi-": (0, 1 / sqrt(2), -1 / sqrt(2), 0)
+        "psi-": (0, 1 / sqrt(2), -1 / sqrt(2), 0),
     }
 
     def __init__(self, name, timeline, wavelengths=None, frequency=8e7, mean_photon_num=0.1,
-                 encoding_type=polarization, phase_error=0, bandwidth=0, photon_statistics="thermal", bell_state="psi-"):
+                 encoding_type=polarization, phase_error=0, bandwidth=0, photon_statistics="thermal", bell_state="psi-",
+                 use_sparse_emission=False):
         """
         Constructor for SPDCBellSource.
 
@@ -136,7 +137,8 @@ class SPDCBellSource(LightSource):
             encoding_type (dict): Photon encoding scheme (default polarization encoding).
             phase_error (float): Phase flip probability (currently unused, default 0).
             bandwidth (float): Wavelength range for Gaussian sampling in nm (default 0).
-                The standard deviation is bandwidth/3.
+                Interpreted as FWHM in wavelength; standard deviation is
+                bandwidth/2.355 for Gaussian sampling.
             photon_statistics (str): Photon pair distribution type (default "thermal").
                 Options: "thermal" (Bose-Einstein) or "poisson" (coherent).
             bell_state (str): Bell state to emit (default "psi-").
@@ -153,6 +155,7 @@ class SPDCBellSource(LightSource):
         self.bell_state_label = bell_state
         self.bell_state = self.bell_state_map[bell_state]
         self.bandwidth = bandwidth
+        self.use_sparse_emission = bool(use_sparse_emission)
 
     def init(self):
         assert len(self._receivers) == 2, "SPDCBellSource source must connect to 2 receivers."
@@ -180,6 +183,76 @@ class SPDCBellSource(LightSource):
         
         else:
             raise ValueError(f"Unknown photon_statistics: {self.photon_statistics}")
+
+    def _sample_active_pulses_and_pair_counts(self, num_pulses: int):
+        """Yield non-empty pulse indices and pair counts for sparse emission."""
+        mu = float(self.mean_photon_num)
+        if mu <= 0.0 or num_pulses <= 0:
+            return
+
+        rng = self.get_generator()
+        if self.photon_statistics == "thermal":
+            p_zero = 1.0 / (1.0 + mu)
+            p_nonzero = 1.0 - p_zero
+            conditional_pair_count = lambda: int(rng.geometric(p_zero))
+        elif self.photon_statistics == "poisson":
+            p_nonzero = 1.0 - float(np.exp(-mu))
+
+            def conditional_pair_count() -> int:
+                count = int(rng.poisson(mu))
+                while count <= 0:
+                    count = int(rng.poisson(mu))
+                return count
+        else:
+            raise ValueError(f"Unknown photon_statistics: {self.photon_statistics}")
+
+        if p_nonzero <= 0.0:
+            return
+
+        pulse_index = int(rng.geometric(p_nonzero) - 1)
+        while pulse_index < num_pulses:
+            yield pulse_index, conditional_pair_count()
+            pulse_index += int(rng.geometric(p_nonzero))
+
+    def _emit_pair(self, time, lambda_signal_center: float, lambda_pump: float, sigma: float) -> None:
+        delta = sigma * self.get_generator().standard_normal()
+        while sigma > 0 and abs(delta) > 3 * sigma:
+            delta = sigma * self.get_generator().standard_normal()
+
+        lambda_signal = lambda_signal_center + delta
+        inv_pump = 1.0 / lambda_pump
+        inv_signal = 1.0 / lambda_signal
+        inv_idler = inv_pump - inv_signal
+        if inv_idler <= 0:
+            # This shouldn't happen with reasonable bandwidth, but safety check.
+            print(f"Warning: Invalid idler wavelength at signal={lambda_signal:.3f} nm. Skipping pair.")
+            return
+        lambda_idler = 1.0 / inv_idler
+
+        new_photon0 = Photon(
+            "signal",
+            self.timeline,
+            wavelength=lambda_signal,
+            location=self,
+            encoding_type=self.encoding_type,
+        )
+        new_photon1 = Photon(
+            "idler",
+            self.timeline,
+            wavelength=lambda_idler,
+            location=self,
+            encoding_type=self.encoding_type,
+        )
+        pair_id = f"{self.name}:{self.photon_counter}"
+        new_photon0.pair_id = pair_id
+        new_photon1.pair_id = pair_id
+        new_photon0.pair_source = self.name
+        new_photon1.pair_source = self.name
+
+        new_photon0.combine_state(new_photon1)
+        new_photon0.set_state(self.bell_state)
+        self.send_photons(time, [new_photon0, new_photon1])
+        self.photon_counter += 1
     
     def emit(self, num_pulses=1):
         """
@@ -191,7 +264,8 @@ class SPDCBellSource(LightSource):
 
         Wavelength correlation: Signal wavelength is sampled from a Gaussian
         distribution centered at lambda_signal_center with standard deviation
-        = bandwidth/3. Idler wavelength is computed using EXACT energy conservation:
+        = bandwidth/2.355 (bandwidth interpreted as FWHM). Idler wavelength is
+        computed using EXACT energy conservation:
         1/lambda_pump = 1/lambda_signal + 1/lambda_idler
 
         Timing: Pulses are spaced by 1/frequency. Photon pairs within a pulse
@@ -215,38 +289,19 @@ class SPDCBellSource(LightSource):
         lam_avg = 0.5 * (lambda_signal_center + lambda_idler_center)
         lambda_pump = lam_avg / 2.0
 
-        sigma = self.bandwidth / 3.0 if self.bandwidth > 0 else 0.0
+        sigma = self.bandwidth / 2.355 if self.bandwidth > 0 else 0.0
+
+        if self.use_sparse_emission:
+            for pulse_index, num_pairs in self._sample_active_pulses_and_pair_counts(int(num_pulses)):
+                pulse_time = time + int(pulse_index) * period
+                for _ in range(num_pairs):
+                    self._emit_pair(pulse_time, lambda_signal_center, lambda_pump, sigma)
+            return
 
         for _ in range(num_pulses):
             num_pairs = self.sample_photon_pairs()
             for _ in range(num_pairs):
-                delta = sigma * self.get_generator().standard_normal()
-                while abs(delta) > 3 * sigma:
-                    delta = sigma * self.get_generator().standard_normal()
-
-                lambda_signal = lambda_signal_center  + delta
-                inv_pump = 1.0 / lambda_pump
-                inv_signal = 1.0 / lambda_signal
-                inv_idler = inv_pump - inv_signal
-                if inv_idler <= 0:
-                    # This shouldn't happen with reasonable bandwidth, but safety check
-                    print(f"Warning: Invalid idler wavelength at signal={lambda_signal:.3f} nm. Skipping pair.")
-                    continue
-                lambda_idler = 1.0 / inv_idler
-                
-                new_photon0 = Photon("signal", self.timeline,
-                                     wavelength=lambda_signal,
-                                     location=self,
-                                     encoding_type=self.encoding_type)
-                new_photon1 = Photon("idler", self.timeline,
-                                     wavelength=lambda_idler,
-                                     location=self,
-                                     encoding_type=self.encoding_type)
-
-                new_photon0.combine_state(new_photon1)
-                new_photon0.set_state(self.bell_state)
-                self.send_photons(time, [new_photon0, new_photon1])
-                self.photon_counter += 1
+                self._emit_pair(time, lambda_signal_center, lambda_pump, sigma)
             time += period
     
     def send_photons(self, time, photons: list["Photon"]):

@@ -8,11 +8,13 @@ from ..topology.node import Node
 from ..components.detector import QSDetectorPolarizationStatic
 from ..components.wave_plate import WavePlate
 from ..components.light_source import SPDCBellSource
+from ..components.beam_splitter import HOMBeamSplitter
 from ..utils.encoding import polarization
 from ..kernel.entity import Entity
 from ..components.photon import Photon
 from typing import Optional, Dict, Any
 import numpy as np
+from collections import deque
 
 
 class SourcePort(Entity):
@@ -46,7 +48,9 @@ class SpdcSourceNode(Node):
             'phase_error': 0.0,
             'bandwidth': 0,
             'encoding': polarization,
-            'bell_state': 'psi-'
+            'photon_statistics': 'thermal',
+            'bell_state': 'psi-',
+            'use_sparse_emission': False,
         }
 
         # Merge with user config
@@ -62,14 +66,17 @@ class SpdcSourceNode(Node):
             phase_error=float(merged_config['phase_error']),
             bandwidth=float(merged_config['bandwidth']),
             encoding_type=merged_config['encoding'],
-            bell_state=merged_config['bell_state']           
+            photon_statistics=merged_config['photon_statistics'],
+            bell_state=merged_config['bell_state'],
+            use_sparse_emission=bool(merged_config['use_sparse_emission']),
 
         )
 
         # Create and connect output ports
         self.ports = {}
         for i in range(2):
-            self.ports[i] = SourcePort(str(i), self.timeline, self)
+            port_name = f"{self.name}.port{i}"
+            self.ports[i] = SourcePort(port_name, self.timeline, self)
             self.spdc.add_receiver(self.ports[i])
 
         self.first_component_name = self.spdc.name
@@ -468,6 +475,10 @@ class PolarizationAnalyzerNode(Node):
             Clears internal detector buffer.
         """
         return self.detector.get_photon_times()
+
+    def get_detection_records(self) -> list:
+        """Get per-channel detection records from the analyzer detector."""
+        return self.detector.get_detection_records()
     
     def get_detection_counts(self) -> tuple:
         """Get number of detections on each output.
@@ -522,3 +533,487 @@ class PolarizationAnalyzerNode(Node):
         self.detector.detectors[detector_index].get()
 
         self.classical_noise_count += 1
+
+class HOMInputPort(Entity):
+    """Input port for the HOM beam splitter node."""
+
+    def __init__(self, name, timeline, owner: Node, port_index: int):
+        super().__init__(name, timeline)
+        self.owner = owner
+        self.port_index = port_index
+
+    def init(self):
+        pass
+
+    def get(self, photon, **kwargs):
+        self.owner.receive_photon(photon, self.port_index)
+
+
+class PhotonSinkNode(Node):
+    """Dummy sink node used to absorb unused photons (e.g., source signal arms)."""
+
+    def __init__(self, name, timeline):
+        super().__init__(name, timeline)
+
+    def init(self):
+        super().init()
+    
+    def receive_qubit(self, src, qubit):
+        # Absorb and ignore incoming photons
+        pass
+
+    def get(self, photon, **kwargs):
+        # Intentionally discard photon
+        pass
+
+
+class HeraldDetectorNode(Node):
+    """Single-detector node that timestamps photon arrivals with simple SPD behavior."""
+
+    def __init__(self, name: str, timeline, config: Optional[Dict[str, Any]] = None):
+        super().__init__(name, timeline)
+        config = config or {}
+
+        self.detector_efficiency = float(config.get("detector_efficiency", 1.0))
+        self.detector_jitter_ps = float(config.get("detector_jitter_ps", 0.0))
+        self.dark_count_rate_hz = float(
+            config.get("dark_count_rate_hz", config.get("dark_count", 0.0))
+        )
+
+        self.trigger_times = []
+        self._run_start_ps = int(self.timeline.now())
+        self._last_event_ps = int(self.timeline.now())
+        self._dark_counts_injected = False
+
+    def init(self):
+        super().init()
+
+    def receive_qubit(self, src, qubit):
+        self._record_detection(int(self.timeline.now()))
+
+    def get(self, photon, **kwargs):
+        self._record_detection(int(self.timeline.now()))
+
+    def _sample_jitter_ps(self) -> int:
+        if self.detector_jitter_ps <= 0:
+            return 0
+        return int(np.rint(self.get_generator().normal(0.0, self.detector_jitter_ps)))
+
+    def _record_detection(self, nominal_click_ps: int) -> None:
+        self._dark_counts_injected = False
+        self._last_event_ps = max(self._last_event_ps, nominal_click_ps)
+
+        eta = float(np.clip(self.detector_efficiency, 0.0, 1.0))
+        if self.get_generator().random() > eta:
+            return
+
+        jitter = self._sample_jitter_ps()
+        click_ps = int(max(0, nominal_click_ps + jitter))
+        self.trigger_times.append(click_ps)
+        self._last_event_ps = max(self._last_event_ps, click_ps)
+
+    def _inject_dark_counts(self) -> None:
+        if self._dark_counts_injected or self.dark_count_rate_hz <= 0:
+            self._dark_counts_injected = True
+            return
+
+        end_ps = max(self._last_event_ps, int(self.timeline.now()))
+        duration_ps = max(0, end_ps - self._run_start_ps)
+        if duration_ps <= 0:
+            self._dark_counts_injected = True
+            return
+
+        expected = self.dark_count_rate_hz * (duration_ps * 1e-12)
+        count = int(self.get_generator().poisson(expected))
+        if count > 0:
+            draws = self.get_generator().random(count)
+            for draw in draws:
+                t_ps = int(self._run_start_ps + draw * duration_ps)
+                self.trigger_times.append(t_ps)
+
+        self._dark_counts_injected = True
+
+    def get_click_times(self, include_dark_counts: bool = True, reset: bool = False) -> list[int]:
+        if include_dark_counts:
+            self._inject_dark_counts()
+
+        out = sorted(self.trigger_times)
+        if reset:
+            self.reset_logs()
+        return out
+
+    def get_photon_times(self) -> list[int]:
+        return self.get_click_times(include_dark_counts=True, reset=True)
+
+    def reset_logs(self) -> None:
+        self.trigger_times = []
+        self._dark_counts_injected = False
+        now_ps = int(self.timeline.now())
+        self._run_start_ps = now_ps
+        self._last_event_ps = now_ps
+
+
+class HOMInterferenceNode(Node):
+    """Central timing-based Hong-Ou-Mandel interference node.
+
+    Two remote sources deliver photons through standard quantum channels via
+    `receive_qubit(src, qubit)`. Input-arm identity is inferred from `src`.
+
+    Matching and interference are timing-based:
+    - Per-arm arrival queues are paired by effective arrival-time compatibility.
+    - A configurable scan delay is applied to one arm.
+    - Paired photons are processed by a dedicated `HOMBeamSplitter`.
+    - Unmatched photons follow an explicit single-photon policy.
+
+    Detector model:
+    - efficiency,
+    - Gaussian timing jitter,
+    - optional dark counts,
+    - coincidence extraction with configurable window.
+    """
+
+    def __init__(self, name: str, timeline, config: Optional[Dict[str, Any]] = None):
+        super().__init__(name, timeline)
+        config = config or {}
+
+        self.scan_delay_ps = int(config.get("scan_delay_ps", config.get("delay_ps", 0)))
+        self.delayed_arm = int(config.get("delayed_arm", 1))
+        self.source_bandwidth_nm = float(config.get("source_bandwidth_nm", 0.0))
+        self.source_bandwidth_arm0_nm = float(
+            config.get("source_bandwidth_arm0_nm", self.source_bandwidth_nm)
+        )
+        self.source_bandwidth_arm1_nm = float(
+            config.get("source_bandwidth_arm1_nm", self.source_bandwidth_nm)
+        )
+        self.center_wavelength_arm0_nm = config.get("center_wavelength_arm0_nm", None)
+        self.center_wavelength_arm1_nm = config.get("center_wavelength_arm1_nm", None)
+        self.coincidence_window_ps = int(config.get("coincidence_window_ps", 1000))
+        self.detector_efficiency = float(config.get("detector_efficiency", 0.9))
+        self.detector_jitter_ps = float(config.get("detector_jitter_ps", 0.0))
+        self.matching_window_ps = int(config.get("matching_window_ps", config.get("match_window_ps", 2000)))
+        self.spectral_overlap_sigma_nm = config.get("spectral_overlap_sigma_nm", None)
+
+        # Single catch-all overlap reduction factor.
+        # Legacy keys map here for backward compatibility.
+        self.extra_overlap_scale = float(
+            config.get("extra_overlap_scale", config.get("mode_overlap", config.get("visibility", 1.0)))
+        )
+        self.dark_count_rate_hz = float(config.get("dark_count_rate_hz", config.get("dark_count", 0.0)))
+
+        # Pre-BS per-arm loss probabilities.
+        losses = config.get("arm_loss", [0.0, 0.0])
+        if isinstance(losses, dict):
+            self.arm_loss = {
+                0: float(losses.get(0, losses.get("0", 0.0))),
+                1: float(losses.get(1, losses.get("1", 0.0))),
+            }
+        else:
+            self.arm_loss = {
+                0: float(losses[0]) if len(losses) > 0 else 0.0,
+                1: float(losses[1]) if len(losses) > 1 else 0.0,
+            }
+
+        # Policy for photons that cannot be paired in time:
+        # "single" routes as distinguishable single-photon BS events,
+        # "discard" drops them.
+        self.unmatched_policy = str(config.get("unmatched_policy", "single")).lower()
+
+        # Source-name -> arm index (0/1).
+        self.input_map: Dict[str, int] = {}
+        self.pending = {0: deque(), 1: deque()}
+
+        # Click logs (detector 0 / detector 1), in ps.
+        self.trigger_times = [[], []]
+        self.interference_events = []
+
+        self._run_start_ps = int(self.timeline.now())
+        self._last_event_ps = int(self.timeline.now())
+        self._dark_counts_injected = False
+
+        self.hom_splitter = HOMBeamSplitter(f"{name}.hom_bs", timeline)
+        self.add_component(self.hom_splitter)
+
+    def init(self):
+        super().init()
+        self.hom_splitter.init()
+
+    # ------------------------------------------------------------------
+    # Configuration API
+    # ------------------------------------------------------------------
+
+    def register_input(self, src_name: str, port_index: int) -> None:
+        if port_index not in (0, 1):
+            raise ValueError(f"port_index must be 0 or 1, got {port_index}")
+        self.input_map[src_name] = int(port_index)
+
+    def set_scan_delay_ps(self, scan_delay_ps: int) -> None:
+        self.scan_delay_ps = int(scan_delay_ps)
+
+    def set_delay_ps(self, delay_ps: int) -> None:
+        # Compatibility alias.
+        self.set_scan_delay_ps(delay_ps)
+
+    def set_source_bandwidth_nm(self, source_bandwidth_nm: float) -> None:
+        self.source_bandwidth_nm = float(source_bandwidth_nm)
+
+    def set_mode_overlap(self, mode_overlap: float) -> None:
+        # Compatibility alias: mode_overlap maps to extra overlap scale.
+        self.extra_overlap_scale = float(mode_overlap)
+
+    def set_visibility(self, visibility: float) -> None:
+        # Legacy knob retained as optional additional overlap scale.
+        self.extra_overlap_scale = float(visibility)
+
+    def set_matching_window_ps(self, matching_window_ps: int) -> None:
+        self.matching_window_ps = int(matching_window_ps)
+
+    def set_coincidence_window_ps(self, coincidence_window_ps: int) -> None:
+        self.coincidence_window_ps = int(coincidence_window_ps)
+
+    # ------------------------------------------------------------------
+    # Photon handling
+    # ------------------------------------------------------------------
+
+    def receive_qubit(self, src, qubit) -> None:
+        """Receive a photon from a quantum channel and enqueue by source arm."""
+        if src not in self.input_map:
+            return
+
+        arm = self.input_map[src]
+        arrival_ps = int(self.timeline.now())
+        self._last_event_ps = max(self._last_event_ps, arrival_ps)
+        self._dark_counts_injected = False
+
+        if self.get_generator().random() < self.arm_loss.get(arm, 0.0):
+            return
+
+        self.pending[arm].append({
+            "arrival_ps": arrival_ps,
+            "source": src,
+            "photon": qubit,
+        })
+        self._process_pending()
+
+    def _effective_arrival(self, arm: int, arrival_ps: int) -> int:
+        if arm == self.delayed_arm:
+            return int(arrival_ps + self.scan_delay_ps)
+        return int(arrival_ps)
+
+    def _process_pending(self) -> None:
+        while self.pending[0] and self.pending[1]:
+            p0 = self.pending[0][0]
+            p1 = self.pending[1][0]
+            eff0 = self._effective_arrival(0, p0["arrival_ps"])
+            eff1 = self._effective_arrival(1, p1["arrival_ps"])
+            dt = int(eff0 - eff1)
+
+            if abs(dt) <= self.matching_window_ps:
+                self.pending[0].popleft()
+                self.pending[1].popleft()
+                self._process_interfering_pair(p0, p1, eff0, eff1)
+                continue
+
+            if eff0 < eff1:
+                self.pending[0].popleft()
+                self._handle_unmatched_single(0, p0, eff0)
+            else:
+                self.pending[1].popleft()
+                self._handle_unmatched_single(1, p1, eff1)
+
+    def _process_interfering_pair(self, p0: dict, p1: dict, eff0_ps: int, eff1_ps: int) -> None:
+        lambda0 = float(getattr(p0["photon"], "wavelength", 1550.0))
+        lambda1 = float(getattr(p1["photon"], "wavelength", 1550.0))
+        center0 = float(lambda0 if self.center_wavelength_arm0_nm is None else self.center_wavelength_arm0_nm)
+        center1 = float(lambda1 if self.center_wavelength_arm1_nm is None else self.center_wavelength_arm1_nm)
+        lambda_nm = 0.5 * (center0 + center1)
+
+        if self.delayed_arm == 1:
+            result = self.hom_splitter.two_photon_outcome(
+                arrival_arm0_ps=p0["arrival_ps"],
+                arrival_arm1_ps=p1["arrival_ps"],
+                photon_arm0=p0["photon"],
+                photon_arm1=p1["photon"],
+                scan_delay_ps=self.scan_delay_ps,
+                lambda_nm=lambda_nm,
+                bandwidth_nm=self.source_bandwidth_nm,
+                lambda_arm0_nm=center0,
+                lambda_arm1_nm=center1,
+                bandwidth_arm0_nm=self.source_bandwidth_arm0_nm,
+                bandwidth_arm1_nm=self.source_bandwidth_arm1_nm,
+                extra_overlap_scale=self.extra_overlap_scale,
+            )
+        else:
+            result = self.hom_splitter.two_photon_outcome(
+                arrival_arm0_ps=p1["arrival_ps"],
+                arrival_arm1_ps=p0["arrival_ps"],
+                photon_arm0=p1["photon"],
+                photon_arm1=p0["photon"],
+                scan_delay_ps=self.scan_delay_ps,
+                lambda_nm=lambda_nm,
+                bandwidth_nm=self.source_bandwidth_nm,
+                lambda_arm0_nm=center1,
+                lambda_arm1_nm=center0,
+                bandwidth_arm0_nm=self.source_bandwidth_arm0_nm,
+                bandwidth_arm1_nm=self.source_bandwidth_arm1_nm,
+                extra_overlap_scale=self.extra_overlap_scale,
+            )
+
+        outputs = result["outputs"]
+        n0 = int(outputs.count(0))
+        n1 = int(outputs.count(1))
+        nominal_click_ps = int(max(eff0_ps, eff1_ps))
+        self._apply_detector_response(n0, n1, nominal_click_ps)
+
+        result["effective_arrival_arm0_ps"] = int(eff0_ps)
+        result["effective_arrival_arm1_ps"] = int(eff1_ps)
+        result["matching_delta_t_ps"] = int(eff0_ps - eff1_ps)
+        result["src_arm0"] = p0["source"]
+        result["src_arm1"] = p1["source"]
+        result["pair_id_arm0"] = getattr(p0["photon"], "pair_id", None)
+        result["pair_id_arm1"] = getattr(p1["photon"], "pair_id", None)
+        self.interference_events.append(result)
+
+
+    def _handle_unmatched_single(self, arm: int, photon_entry: dict, effective_arrival_ps: int) -> None:
+        if self.unmatched_policy == "discard":
+            return
+
+        detector_index = self.hom_splitter.single_photon_output()
+        n0 = 1 if detector_index == 0 else 0
+        n1 = 1 if detector_index == 1 else 0
+        self._apply_detector_response(n0, n1, int(effective_arrival_ps))
+
+    def _sample_jitter_ps(self) -> int:
+        if self.detector_jitter_ps <= 0:
+            return 0
+        return int(np.rint(self.get_generator().normal(0.0, self.detector_jitter_ps)))
+
+    def _apply_detector_response(self, photons_det0: int, photons_det1: int, nominal_click_ps: int) -> None:
+        # Threshold detector response: P(click|n photons)=1-(1-eta)^n.
+        eta = float(np.clip(self.detector_efficiency, 0.0, 1.0))
+        for detector_index, n_photons in enumerate([photons_det0, photons_det1]):
+            if n_photons <= 0:
+                continue
+
+            p_click = 1.0 - (1.0 - eta) ** int(n_photons)
+            if self.get_generator().random() <= p_click:
+                jitter = self._sample_jitter_ps()
+                click_ps = int(max(0, nominal_click_ps + jitter))
+                self.trigger_times[detector_index].append(click_ps)
+                self._last_event_ps = max(self._last_event_ps, click_ps)
+
+    def receive_noise_photon(self) -> None:
+        """Handle Raman/background noise photon arrival at the BSM node.
+
+        The fiber channel schedules this callback on the receiver when
+        classical coexistence noise is enabled. We model unpolarized noise
+        as a 50/50 random click on one of the two BSM detectors.
+        """
+        det_idx = 0 if self.get_generator().random() < 0.5 else 1
+        n0 = 1 if det_idx == 0 else 0
+        n1 = 1 if det_idx == 1 else 0
+        self._apply_detector_response(n0, n1, int(self.timeline.now()))
+
+    def _inject_dark_counts(self) -> None:
+        if self._dark_counts_injected or self.dark_count_rate_hz <= 0:
+            self._dark_counts_injected = True
+            return
+
+        end_ps = max(self._last_event_ps, int(self.timeline.now()))
+        duration_ps = max(0, end_ps - self._run_start_ps)
+        if duration_ps <= 0:
+            self._dark_counts_injected = True
+            return
+
+        expected = self.dark_count_rate_hz * (duration_ps * 1e-12)
+        for detector_index in (0, 1):
+            count = int(self.get_generator().poisson(expected))
+            if count <= 0:
+                continue
+            draws = self.get_generator().random(count)
+            for draw in draws:
+                t_ps = int(self._run_start_ps + draw * duration_ps)
+                self.trigger_times[detector_index].append(t_ps)
+
+        self._dark_counts_injected = True
+
+    # ------------------------------------------------------------------
+    # Data access + analysis helpers
+    # ------------------------------------------------------------------
+
+    def flush(self) -> None:
+        while self.pending[0]:
+            p0 = self.pending[0].popleft()
+            eff0 = self._effective_arrival(0, p0["arrival_ps"])
+            self._handle_unmatched_single(0, p0, eff0)
+        while self.pending[1]:
+            p1 = self.pending[1].popleft()
+            eff1 = self._effective_arrival(1, p1["arrival_ps"])
+            self._handle_unmatched_single(1, p1, eff1)
+
+    def get_click_times(self, flush: bool = True, include_dark_counts: bool = True, reset: bool = False) -> list:
+        if flush:
+            self.flush()
+        if include_dark_counts:
+            self._inject_dark_counts()
+
+        out = [sorted(self.trigger_times[0]), sorted(self.trigger_times[1])]
+        if reset:
+            self.reset_logs(clear_pending=True)
+        return out
+
+    def get_photon_times(self) -> list:
+        # Compatibility behavior with previous HOM node: returns and clears logs.
+        return self.get_click_times(flush=True, include_dark_counts=True, reset=True)
+
+    def get_detection_counts(self) -> tuple:
+        times = self.get_photon_times()
+        return (len(times[0]), len(times[1]))
+
+    def count_coincidences(self, coincidence_window_ps: Optional[int] = None) -> int:
+        window = int(self.coincidence_window_ps if coincidence_window_ps is None else coincidence_window_ps)
+        t0, t1 = self.get_click_times(flush=True, include_dark_counts=True, reset=False)
+        i = 0
+        j = 0
+        count = 0
+        while i < len(t0) and j < len(t1):
+            dt = int(t0[i] - t1[j])
+            if abs(dt) <= window:
+                count += 1
+                i += 1
+                j += 1
+            elif dt < -window:
+                i += 1
+            else:
+                j += 1
+        return count
+
+    def click_time_differences(self, max_abs_dt_ps: Optional[int] = None) -> list:
+        t0, t1 = self.get_click_times(flush=True, include_dark_counts=True, reset=False)
+        deltas = []
+        j0 = 0
+        for t in t0:
+            while j0 < len(t1) and t1[j0] < t - self.coincidence_window_ps:
+                j0 += 1
+            j = j0
+            while j < len(t1) and t1[j] <= t + self.coincidence_window_ps:
+                dt = int(t - t1[j])
+                if max_abs_dt_ps is None or abs(dt) <= int(max_abs_dt_ps):
+                    deltas.append(dt)
+                j += 1
+        return deltas
+
+    def reset_logs(self, clear_pending: bool = True) -> None:
+        self.trigger_times = [[], []]
+        self.interference_events = []
+        self._dark_counts_injected = False
+        now_ps = int(self.timeline.now())
+        self._run_start_ps = now_ps
+        self._last_event_ps = now_ps
+        if clear_pending:
+            self.pending[0].clear()
+            self.pending[1].clear()
+
+
+class HOMBeamSplitterNode(HOMInterferenceNode):
+    """Compatibility wrapper for older notebooks using HOMBeamSplitterNode name."""
