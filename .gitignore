@@ -154,6 +154,7 @@ example/hom_swapping_validation/results/
 
 # Generated AI diagnosis dataset artifacts
 example/entanglement_distribution_experiment/ai_diagnosis_dataset/generated/
+example/hom_swapping_validation/ai_bsm_dataset/generated/
 
 # Local experiment smoke/result directories
 example/entanglement_distribution_experiment/memory_allocation_results_smoke*/

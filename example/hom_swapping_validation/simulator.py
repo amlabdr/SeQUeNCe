@@ -31,6 +31,8 @@ class SequenceHOMConfig:
     emission_chunk_pulses: int = 25_000
     source_frequency_hz: float = 8e7
     mean_photon_num: float = 0.12
+    mean_photon_num_a: Optional[float] = None
+    mean_photon_num_b: Optional[float] = None
     source_bandwidth_nm: float = 0.6
     wavelengths_nm_a: Tuple[float, float] = (1550.0, 1550.0)
     wavelengths_nm_b: Tuple[float, float] = (1550.0, 1550.0)
@@ -55,6 +57,10 @@ class SequenceHOMConfig:
     herald_channel_b: int = 0
     extra_overlap_scale: float = 1.0
     attenuation_db_per_m: float = 0.00002
+    attenuation_db_per_m_signal_a: Optional[float] = None
+    attenuation_db_per_m_signal_b: Optional[float] = None
+    attenuation_db_per_m_herald_a: Optional[float] = None
+    attenuation_db_per_m_herald_b: Optional[float] = None
     fiber_spec_signal_a: FiberSpec = field(default_factory=FiberSpec)
     fiber_spec_signal_b: FiberSpec = field(default_factory=FiberSpec)
     fiber_spec_herald_a: FiberSpec = field(default_factory=FiberSpec)
@@ -62,6 +68,7 @@ class SequenceHOMConfig:
     seed: int = 1234
     pol_rotation_arm0_rad: float = 0.0
     pol_rotation_arm1_rad: float = 0.0
+    use_signal_rotators: bool = True
 
 
 def _sorted_array(values: Sequence[int], assume_sorted: bool = False) -> np.ndarray:
@@ -331,7 +338,9 @@ def run_hom_sequence_delay_scan(
             {
                 "wavelengths": list(cfg.wavelengths_nm_a),
                 "frequency": float(cfg.source_frequency_hz),
-                "mean_photon_num": float(cfg.mean_photon_num),
+                "mean_photon_num": float(
+                    cfg.mean_photon_num if cfg.mean_photon_num_a is None else cfg.mean_photon_num_a
+                ),
                 "bandwidth": float(cfg.source_bandwidth_nm),
                 "encoding": polarization,
                 "photon_statistics": cfg.photon_statistics,
@@ -345,7 +354,9 @@ def run_hom_sequence_delay_scan(
             {
                 "wavelengths": list(cfg.wavelengths_nm_b),
                 "frequency": float(cfg.source_frequency_hz),
-                "mean_photon_num": float(cfg.mean_photon_num),
+                "mean_photon_num": float(
+                    cfg.mean_photon_num if cfg.mean_photon_num_b is None else cfg.mean_photon_num_b
+                ),
                 "bandwidth": float(cfg.source_bandwidth_nm),
                 "encoding": polarization,
                 "photon_statistics": cfg.photon_statistics,
@@ -401,33 +412,74 @@ def run_hom_sequence_delay_scan(
             herald_a = _PhotonSinkNode("herald_a_sink", timeline)
             herald_b = _PhotonSinkNode("herald_b_sink", timeline)
 
-        rot_a = _WavePlateRelayNode("rot_a", timeline, plate_type="HWP", angle_rad=float(cfg.pol_rotation_arm0_rad) / 2.0)
-        rot_b = _WavePlateRelayNode("rot_b", timeline, plate_type="HWP", angle_rad=float(cfg.pol_rotation_arm1_rad) / 2.0)
+        use_signal_rotators = bool(cfg.use_signal_rotators)
+        if use_signal_rotators:
+            rot_a = _WavePlateRelayNode(
+                "rot_a",
+                timeline,
+                plate_type="HWP",
+                angle_rad=float(cfg.pol_rotation_arm0_rad) / 2.0,
+            )
+            rot_b = _WavePlateRelayNode(
+                "rot_b",
+                timeline,
+                plate_type="HWP",
+                angle_rad=float(cfg.pol_rotation_arm1_rad) / 2.0,
+            )
 
         ch_sig_a = _build_fiber_channel(
-            "qc_sig_a", timeline, cfg.arm_length_m_a, cfg.attenuation_db_per_m, cfg.fiber_spec_signal_a
+            "qc_sig_a",
+            timeline,
+            cfg.arm_length_m_a,
+            cfg.attenuation_db_per_m
+            if cfg.attenuation_db_per_m_signal_a is None
+            else cfg.attenuation_db_per_m_signal_a,
+            cfg.fiber_spec_signal_a,
         )
         ch_sig_b = _build_fiber_channel(
-            "qc_sig_b", timeline, cfg.arm_length_m_b, cfg.attenuation_db_per_m, cfg.fiber_spec_signal_b
+            "qc_sig_b",
+            timeline,
+            cfg.arm_length_m_b,
+            cfg.attenuation_db_per_m
+            if cfg.attenuation_db_per_m_signal_b is None
+            else cfg.attenuation_db_per_m_signal_b,
+            cfg.fiber_spec_signal_b,
         )
         ch_herald_a = _build_fiber_channel(
-            "qc_herald_a", timeline, cfg.herald_length_m_a, cfg.attenuation_db_per_m, cfg.fiber_spec_herald_a
+            "qc_herald_a",
+            timeline,
+            cfg.herald_length_m_a,
+            cfg.attenuation_db_per_m
+            if cfg.attenuation_db_per_m_herald_a is None
+            else cfg.attenuation_db_per_m_herald_a,
+            cfg.fiber_spec_herald_a,
         )
         ch_herald_b = _build_fiber_channel(
-            "qc_herald_b", timeline, cfg.herald_length_m_b, cfg.attenuation_db_per_m, cfg.fiber_spec_herald_b
+            "qc_herald_b",
+            timeline,
+            cfg.herald_length_m_b,
+            cfg.attenuation_db_per_m
+            if cfg.attenuation_db_per_m_herald_b is None
+            else cfg.attenuation_db_per_m_herald_b,
+            cfg.fiber_spec_herald_b,
         )
 
-        # signal = port0 -> one fiber -> waveplate relay attached to BSM.
+        # signal = port0 -> one fiber -> optional waveplate relay -> BSM.
         # idler = port1 -> local herald analyzer.
-        ch_sig_a.set_ends(source_a, rot_a.name)
-        ch_sig_b.set_ends(source_b, rot_b.name)
-        rot_a.set_output_node(hom)
-        rot_b.set_output_node(hom)
+        if use_signal_rotators:
+            ch_sig_a.set_ends(source_a, rot_a.name)
+            ch_sig_b.set_ends(source_b, rot_b.name)
+            rot_a.set_output_node(hom)
+            rot_b.set_output_node(hom)
+            hom.register_input(rot_a.name, 0)
+            hom.register_input(rot_b.name, 1)
+        else:
+            ch_sig_a.set_ends(source_a, hom.name)
+            ch_sig_b.set_ends(source_b, hom.name)
+            hom.register_input(source_a.name, 0)
+            hom.register_input(source_b.name, 1)
         ch_herald_a.set_ends(source_a, herald_a.name)
         ch_herald_b.set_ends(source_b, herald_b.name)
-
-        hom.register_input(rot_a.name, 0)
-        hom.register_input(rot_b.name, 1)
 
         base_seed = int(cfg.seed + 97 * idx)
         source_a.set_seed(base_seed + 1)
