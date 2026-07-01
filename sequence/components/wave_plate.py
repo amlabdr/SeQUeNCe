@@ -111,13 +111,15 @@ class WavePlate(Entity):
             photon.set_state(new_state_tuple)
             
         elif len(full_state) == 4:
-            # Entangled two-photon state (4D)            
-            if photon.name == "signal":
-                op = self.unitary_signal  # Act on first qubit (signal)
-            elif photon.name == "idler":
-                op = self.unitary_idler   # Act on second qubit (idler)
+            # Address the actual subsystem, not a source-specific photon name.
+            entangled_states = getattr(photon.quantum_state, "entangled_states", None)
+            if entangled_states is not None and len(entangled_states) == 2:
+                subsystem = entangled_states.index(photon.quantum_state)
+            elif photon.name in {"signal", "idler"}:
+                subsystem = 0 if photon.name == "signal" else 1
             else:
-                raise ValueError(f"Photon name must be 'signal' or 'idler', got {photon.name}")
+                raise ValueError("Cannot determine photon subsystem for two-qubit waveplate operation")
+            op = self.unitary_signal if subsystem == 0 else self.unitary_idler
             
             new_state = dot(op, full_state)
             photon.set_state(tuple(new_state))

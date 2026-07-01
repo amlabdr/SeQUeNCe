@@ -365,16 +365,29 @@ class FreeQuantumState(State):
         # math for probability calculations
         length_diff = len(entangled_list) - len(states)
 
-        new_states, probabilities = measure_multiple_with_cache(state, basis, length_diff)
+        _, probabilities = measure_multiple_with_cache(state, basis, length_diff)
 
         possible_results = arange(0, basis_dimension, 1)
         # result gives index of the basis vector that will be projected to
         res = rng.choice(possible_results, p=probabilities)
-        # project to new state, then reassign quantum state and entangled photons
-        new_state = new_states[res]
-        for state in entangled_list:
-            state.quantum_state = new_state
-            state.entangled_photons = entangled_list
+        measured_states = entangled_list[:len(states)]
+        remaining_states = entangled_list[len(states):]
+
+        measured_state = tuple(complex(value) for value in basis[res])
+        for measured in measured_states:
+            measured.state = measured_state
+            measured.entangled_states = measured_states
+
+        if remaining_states:
+            measurement_bra = array(basis[res], dtype=complex).conj().reshape(1, -1)
+            projector = kron(measurement_bra, identity(2 ** length_diff))
+            remaining_state = projector @ array(state, dtype=complex)
+            norm = math.sqrt(sum(abs(value) ** 2 for value in remaining_state))
+            assert norm > 0
+            remaining_state = tuple(complex(value) for value in remaining_state / norm)
+            for remaining in remaining_states:
+                remaining.state = remaining_state
+                remaining.entangled_states = remaining_states
 
         return res
 

@@ -37,6 +37,9 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# Generated Slurm job scripts
+*.slurm
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -150,11 +153,13 @@ utils/json_config_generators/*.json
 .virtual_documents/
 
 # HOM validation generated outputs
-example/hom_swapping_validation/results/
+example/hom_validation/results/
 
 # Generated AI diagnosis dataset artifacts
 example/entanglement_distribution_experiment/ai_diagnosis_dataset/generated/
-example/hom_swapping_validation/ai_bsm_dataset/generated/
+example/hom_validation/ai_hom_dataset/generated/
+example/entanglement_swapping_validation/ai_bsm_dataset/generated/
+example/entanglement_swapping_validation/results/
 
 # Local experiment smoke/result directories
 example/entanglement_distribution_experiment/memory_allocation_results_smoke*/

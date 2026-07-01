@@ -879,9 +879,6 @@ class fiberQuantumChannel(QuantumChannel):
                     f"CD={cd_delay*1e12:.1f} ps, "
                     f"Total extra={extra_s*1e12:.1f} ps")"""
 
-            if not extra_delay:
-                print("extra delay is : ", extra_delay)
-            
             base_ps = int(round(self.base_group_delay_s * 1e12))
             future_time = self.timeline.now() + base_ps + extra_delay
             future_time = max(self.timeline.now(), future_time)

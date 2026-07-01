@@ -39,6 +39,7 @@ class SpdcSourceNode(Node):
         super().__init__(name, timeline)
         self.name = name
         self.emission_count = 0
+        self.direct_receivers = {}
 
         # Default values for SPDC configuration
         default_config = {
@@ -103,6 +104,9 @@ class SpdcSourceNode(Node):
                 port_index = 1
             else:
                 raise ValueError(f"Unknown photon type: {photon_type}")
+            if port_index in self.direct_receivers:
+                self.direct_receivers[port_index].receive_qubit(self.name, photon)
+                return
             for index, dst in enumerate(self.qchannels):
                 if str(port_index) == str(index):
                     self.send_qubit(dst, photon)
@@ -113,6 +117,12 @@ class SpdcSourceNode(Node):
     # ========================================================================
     # Configuration API
     # ========================================================================
+
+    def set_direct_receiver(self, port_index: int, receiver: Node) -> None:
+        """Route one source output directly to a receiver without a channel."""
+        if port_index not in (0, 1):
+            raise ValueError("SPDC source port_index must be 0 or 1")
+        self.direct_receivers[int(port_index)] = receiver
 
     def set_bell_state(self, bell_state: str) -> None:
         """Change the Bell state emitted by the source.
@@ -1006,6 +1016,385 @@ class HOMInterferenceNode(Node):
     def reset_logs(self, clear_pending: bool = True) -> None:
         self.trigger_times = [[], []]
         self.interference_events = []
+        self._dark_counts_injected = False
+        now_ps = int(self.timeline.now())
+        self._run_start_ps = now_ps
+        self._last_event_ps = now_ps
+        if clear_pending:
+            self.pending[0].clear()
+            self.pending[1].clear()
+
+
+class PolarizationBSMNode(HOMInterferenceNode):
+    """Polarization-resolved linear-optics Bell-state measurement node.
+
+    The node reuses :class:`HOMBeamSplitter` for the non-polarizing 50:50
+    beam splitter, then measures each spatial output in the H/V basis. Its
+    detector order is ``D3H, D3V, D4H, D4V``.
+
+    With threshold detectors, the accepted passive-linear-optics patterns are:
+
+    - psi-minus: D3H-D4V or D3V-D4H
+    - psi-plus: D3H-D3V or D4H-D4V
+
+    The node does not claim to distinguish phi-plus from phi-minus. For
+    temporally and spectrally indistinguishable matched photons, it performs
+    one joint Bell-basis projection and derives the detector pattern from that
+    same outcome. This projects any remote photons entangled with the measured
+    inputs, as required for entanglement swapping.
+    """
+
+    DETECTOR_NAMES = ("D3H", "D3V", "D4H", "D4V")
+    PSI_MINUS_PATTERNS = frozenset({frozenset((0, 3)), frozenset((1, 2))})
+    PSI_PLUS_PATTERNS = frozenset({frozenset((0, 1)), frozenset((2, 3))})
+    BELL_BASIS = (
+        (1 / np.sqrt(2), 0, 0, 1 / np.sqrt(2)),
+        (1 / np.sqrt(2), 0, 0, -1 / np.sqrt(2)),
+        (0, 1 / np.sqrt(2), 1 / np.sqrt(2), 0),
+        (0, 1 / np.sqrt(2), -1 / np.sqrt(2), 0),
+    )
+    BELL_LABELS = ("phi_plus", "phi_minus", "psi_plus", "psi_minus")
+
+    def __init__(self, name: str, timeline, config: Optional[Dict[str, Any]] = None):
+        config = config or {}
+        super().__init__(name, timeline, config)
+
+        efficiencies = config.get("detector_efficiencies", self.detector_efficiency)
+        if isinstance(efficiencies, dict):
+            self.detector_efficiencies = [
+                float(efficiencies.get(detector, self.detector_efficiency))
+                for detector in self.DETECTOR_NAMES
+            ]
+        elif isinstance(efficiencies, (list, tuple, np.ndarray)):
+            if len(efficiencies) != 4:
+                raise ValueError("detector_efficiencies must contain four values")
+            self.detector_efficiencies = [float(value) for value in efficiencies]
+        else:
+            self.detector_efficiencies = [float(efficiencies)] * 4
+
+        self.pbs_fidelity = float(config.get("pbs_fidelity", 1.0))
+        self.pbs_mismeasure_prob = float(config.get("pbs_mismeasure_prob", 0.0))
+        self.trigger_times = [[], [], [], []]
+        self.interaction_events = []
+
+    @classmethod
+    def classify_detector_pair(cls, detector_a: int, detector_b: int) -> Optional[str]:
+        """Return the identifiable Bell state for a two-detector pattern."""
+        if detector_a == detector_b:
+            return None
+        pattern = frozenset((int(detector_a), int(detector_b)))
+        if pattern in cls.PSI_MINUS_PATTERNS:
+            return "psi_minus"
+        if pattern in cls.PSI_PLUS_PATTERNS:
+            return "psi_plus"
+        return None
+
+    def _measure_hv(self, photon: Photon) -> Optional[int]:
+        if self.get_generator().random() > float(np.clip(self.pbs_fidelity, 0.0, 1.0)):
+            return None
+        result = int(Photon.measure(polarization["bases"][0], photon, self.get_generator()))
+        if self.get_generator().random() < float(np.clip(self.pbs_mismeasure_prob, 0.0, 1.0)):
+            result = 1 - result
+        return result
+
+    def _apply_channel_response(self, detector_index: int, photon_count: int, nominal_click_ps: int) -> bool:
+        if photon_count <= 0:
+            return False
+        eta = float(np.clip(self.detector_efficiencies[detector_index], 0.0, 1.0))
+        p_click = 1.0 - (1.0 - eta) ** int(photon_count)
+        if self.get_generator().random() > p_click:
+            return False
+        click_ps = int(max(0, nominal_click_ps + self._sample_jitter_ps()))
+        self.trigger_times[detector_index].append(click_ps)
+        self._last_event_ps = max(self._last_event_ps, click_ps)
+        return True
+
+    def _apply_pbs_and_detector_response(
+        self,
+        ideal_detector_indices: list[int],
+        nominal_click_ps: int,
+    ) -> list[int]:
+        """Apply PBS loss/error and threshold-detector response to ideal channels."""
+        channel_occupancy = [0, 0, 0, 0]
+        for detector_index in ideal_detector_indices:
+            if self.get_generator().random() > float(np.clip(self.pbs_fidelity, 0.0, 1.0)):
+                continue
+            observed_index = int(detector_index)
+            if self.get_generator().random() < float(np.clip(self.pbs_mismeasure_prob, 0.0, 1.0)):
+                observed_index ^= 1
+            channel_occupancy[observed_index] += 1
+
+        return [
+            detector_index
+            for detector_index, photon_count in enumerate(channel_occupancy)
+            if self._apply_channel_response(detector_index, photon_count, nominal_click_ps)
+        ]
+
+    def _project_bell_pair(self, photon0: Photon, photon1: Photon) -> int:
+        """Jointly project two inputs while preserving collapse of remote partners."""
+        if photon0.use_qm or photon1.use_qm:
+            raise NotImplementedError(
+                "PolarizationBSMNode Bell projection currently requires local FreeQuantumState photons"
+            )
+        if photon1.quantum_state not in photon0.quantum_state.entangled_states:
+            photon0.combine_state(photon1)
+        return int(
+            Photon.measure_multiple(
+                self.BELL_BASIS,
+                [photon0, photon1],
+                self.get_generator(),
+            )
+        )
+
+    def _bell_outcome_channels(self, bell_result: int) -> tuple[list[int], list[int]]:
+        """Return ideal detector channels and spatial outputs for one Bell result."""
+        if bell_result == 2:  # psi-plus: opposite polarization, same BS output
+            channels = [0, 1] if self.get_generator().random() < 0.5 else [2, 3]
+        elif bell_result == 3:  # psi-minus: opposite polarization, opposite BS outputs
+            channels = [0, 3] if self.get_generator().random() < 0.5 else [1, 2]
+        else:  # phi outcomes bunch into one unresolved threshold-detector channel
+            detector_index = int(self.get_generator().choice(4))
+            channels = [detector_index, detector_index]
+        return channels, [channel // 2 for channel in channels]
+
+    def _route_photons(
+        self,
+        photons: list[Photon],
+        spatial_outputs: list[int],
+        nominal_click_ps: int,
+    ) -> list[int]:
+        channel_occupancy = [0, 0, 0, 0]
+        for photon, spatial_output in zip(photons, spatial_outputs):
+            polarization_output = self._measure_hv(photon)
+            if polarization_output is None:
+                continue
+            detector_index = 2 * int(spatial_output) + int(polarization_output)
+            channel_occupancy[detector_index] += 1
+
+        clicked = []
+        for detector_index, photon_count in enumerate(channel_occupancy):
+            if self._apply_channel_response(detector_index, photon_count, nominal_click_ps):
+                clicked.append(detector_index)
+        return clicked
+
+    def _process_interfering_pair(self, p0: dict, p1: dict, eff0_ps: int, eff1_ps: int) -> None:
+        lambda0 = float(getattr(p0["photon"], "wavelength", 1550.0))
+        lambda1 = float(getattr(p1["photon"], "wavelength", 1550.0))
+        center0 = float(lambda0 if self.center_wavelength_arm0_nm is None else self.center_wavelength_arm0_nm)
+        center1 = float(lambda1 if self.center_wavelength_arm1_nm is None else self.center_wavelength_arm1_nm)
+        lambda_nm = 0.5 * (center0 + center1)
+
+        if self.delayed_arm == 1:
+            result = self.hom_splitter.two_photon_outcome(
+                arrival_arm0_ps=p0["arrival_ps"],
+                arrival_arm1_ps=p1["arrival_ps"],
+                photon_arm0=p0["photon"],
+                photon_arm1=p1["photon"],
+                scan_delay_ps=self.scan_delay_ps,
+                lambda_nm=lambda_nm,
+                bandwidth_nm=self.source_bandwidth_nm,
+                lambda_arm0_nm=center0,
+                lambda_arm1_nm=center1,
+                bandwidth_arm0_nm=self.source_bandwidth_arm0_nm,
+                bandwidth_arm1_nm=self.source_bandwidth_arm1_nm,
+                extra_overlap_scale=self.extra_overlap_scale,
+            )
+        else:
+            result = self.hom_splitter.two_photon_outcome(
+                arrival_arm0_ps=p1["arrival_ps"],
+                arrival_arm1_ps=p0["arrival_ps"],
+                photon_arm0=p1["photon"],
+                photon_arm1=p0["photon"],
+                scan_delay_ps=self.scan_delay_ps,
+                lambda_nm=lambda_nm,
+                bandwidth_nm=self.source_bandwidth_nm,
+                lambda_arm0_nm=center1,
+                lambda_arm1_nm=center0,
+                bandwidth_arm0_nm=self.source_bandwidth_arm1_nm,
+                bandwidth_arm1_nm=self.source_bandwidth_arm0_nm,
+                extra_overlap_scale=self.extra_overlap_scale,
+            )
+
+        nominal_click_ps = int(max(eff0_ps, eff1_ps))
+        mode_overlap = float(np.clip(
+            result["temporal_overlap"]
+            * result["spectral_overlap"]
+            * result["extra_overlap_scale"],
+            0.0,
+            1.0,
+        ))
+        coherent_projection = self.get_generator().random() < mode_overlap
+        bell_projection = None
+
+        if coherent_projection:
+            bell_result = self._project_bell_pair(p0["photon"], p1["photon"])
+            bell_projection = self.BELL_LABELS[bell_result]
+            ideal_channels, outputs = self._bell_outcome_channels(bell_result)
+            clicked = self._apply_pbs_and_detector_response(ideal_channels, nominal_click_ps)
+        else:
+            outputs = [int(value) for value in result["outputs"]]
+            if outputs == [0, 1] and self.get_generator().random() < 0.5:
+                outputs.reverse()
+            clicked = self._route_photons(
+                [p0["photon"], p1["photon"]],
+                outputs,
+                nominal_click_ps,
+            )
+        bell_state = self.classify_detector_pair(*clicked) if len(clicked) == 2 else None
+
+        result.update({
+            "effective_arrival_arm0_ps": int(eff0_ps),
+            "effective_arrival_arm1_ps": int(eff1_ps),
+            "matching_delta_t_ps": int(eff0_ps - eff1_ps),
+            "src_arm0": p0["source"],
+            "src_arm1": p1["source"],
+            "pair_id_arm0": getattr(p0["photon"], "pair_id", None),
+            "pair_id_arm1": getattr(p1["photon"], "pair_id", None),
+            "detector_indices": clicked,
+            "detector_names": [self.DETECTOR_NAMES[index] for index in clicked],
+            "bell_state": bell_state,
+            "bell_projection": bell_projection,
+            "mode_overlap": mode_overlap,
+            "coherent_projection": coherent_projection,
+            "accepted": bell_state is not None,
+        })
+        self.interference_events.append(result)
+        self.interaction_events.append(result)
+
+    def _handle_unmatched_single(self, arm: int, photon_entry: dict, effective_arrival_ps: int) -> None:
+        if self.unmatched_policy == "discard":
+            return
+        spatial_output = self.hom_splitter.single_photon_output()
+        self._route_photons(
+            [photon_entry["photon"]],
+            [spatial_output],
+            int(effective_arrival_ps),
+        )
+
+    def receive_noise_photon(self) -> None:
+        """Route one unpolarized noise photon to a random BSM detector."""
+        detector_index = int(self.get_generator().choice(4))
+        self._apply_channel_response(detector_index, 1, int(self.timeline.now()))
+
+    def _inject_dark_counts(self) -> None:
+        if self._dark_counts_injected or self.dark_count_rate_hz <= 0:
+            self._dark_counts_injected = True
+            return
+
+        end_ps = max(self._last_event_ps, int(self.timeline.now()))
+        duration_ps = max(0, end_ps - self._run_start_ps)
+        expected = self.dark_count_rate_hz * (duration_ps * 1e-12)
+        for detector_index in range(4):
+            count = int(self.get_generator().poisson(expected))
+            if count > 0:
+                draws = self.get_generator().random(count)
+                self.trigger_times[detector_index].extend(
+                    int(self._run_start_ps + draw * duration_ps) for draw in draws
+                )
+        self._dark_counts_injected = True
+
+    def get_click_times(
+        self,
+        flush: bool = True,
+        include_dark_counts: bool = True,
+        reset: bool = False,
+    ) -> dict[str, list[int]]:
+        """Return four polarization-resolved timestamp streams."""
+        if flush:
+            self.flush()
+        if include_dark_counts:
+            self._inject_dark_counts()
+        out = {
+            name: sorted(self.trigger_times[index])
+            for index, name in enumerate(self.DETECTOR_NAMES)
+        }
+        if reset:
+            self.reset_logs(clear_pending=True)
+        return out
+
+    def get_photon_times(self) -> dict[str, list[int]]:
+        return self.get_click_times(flush=True, include_dark_counts=True, reset=True)
+
+    def get_detection_counts(self) -> dict[str, int]:
+        times = self.get_click_times(flush=True, include_dark_counts=True, reset=False)
+        return {name: len(values) for name, values in times.items()}
+
+    def drain_click_times(self, include_dark_counts: bool = True) -> dict[str, list[int]]:
+        """Return and clear completed telemetry without clearing pending photons."""
+        streams = self.get_click_times(
+            flush=False,
+            include_dark_counts=include_dark_counts,
+            reset=False,
+        )
+        self.trigger_times = [[], [], [], []]
+        self.interference_events = []
+        self.interaction_events = []
+        self._dark_counts_injected = False
+        now_ps = int(self.timeline.now())
+        self._run_start_ps = now_ps
+        self._last_event_ps = now_ps
+        return streams
+
+    def get_bell_events(
+        self,
+        coincidence_window_ps: Optional[int] = None,
+        include_dark_counts: bool = True,
+    ) -> list[dict]:
+        """Greedily classify accepted Bell patterns from detector timestamps."""
+        window = int(self.coincidence_window_ps if coincidence_window_ps is None else coincidence_window_ps)
+        streams = self.get_click_times(
+            flush=True,
+            include_dark_counts=include_dark_counts,
+            reset=False,
+        )
+        clicks = sorted(
+            (int(time_ps), detector_index)
+            for detector_index, name in enumerate(self.DETECTOR_NAMES)
+            for time_ps in streams[name]
+        )
+        used = set()
+        events = []
+        for i, (time_i, detector_i) in enumerate(clicks):
+            if i in used:
+                continue
+            best = None
+            for j in range(i + 1, len(clicks)):
+                if j in used:
+                    continue
+                time_j, detector_j = clicks[j]
+                if time_j - time_i > window:
+                    break
+                bell_state = self.classify_detector_pair(detector_i, detector_j)
+                if bell_state is None:
+                    continue
+                delta = abs(time_j - time_i)
+                if best is None or delta < best[0]:
+                    best = (delta, j, time_j, detector_j, bell_state)
+            if best is None:
+                continue
+            _, j, time_j, detector_j, bell_state = best
+            used.update((i, j))
+            events.append({
+                "time_ps": int(max(time_i, time_j)),
+                "delta_t_ps": int(time_j - time_i),
+                "detectors": (
+                    self.DETECTOR_NAMES[detector_i],
+                    self.DETECTOR_NAMES[detector_j],
+                ),
+                "bell_state": bell_state,
+            })
+        return events
+
+    def count_bell_states(self, coincidence_window_ps: Optional[int] = None) -> dict[str, int]:
+        counts = {"psi_minus": 0, "psi_plus": 0}
+        for event in self.get_bell_events(coincidence_window_ps=coincidence_window_ps):
+            counts[event["bell_state"]] += 1
+        return counts
+
+    def reset_logs(self, clear_pending: bool = True) -> None:
+        self.trigger_times = [[], [], [], []]
+        self.interference_events = []
+        self.interaction_events = []
         self._dark_counts_injected = False
         now_ps = int(self.timeline.now())
         self._run_start_ps = now_ps
